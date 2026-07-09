@@ -43,6 +43,27 @@ A real small-footprint deployment — 1 vCPU (virtualized AMD EPYC-Milan), 1.9 G
 
 perigeos plus its entire managed workload together: ~523 MiB, ~7% of the single core. Disk usage was 20% (5.6 GiB / 29 GiB). This host had substantial headroom left (~1.1 GiB free memory, CPU essentially idle) for additional workloads.
 
+## Extreme Small-End: Raspberry Pi Zero 2 W
+
+The other end of the spectrum from the density runs above: the same `perigeos` binary, unmodified, on a ~$15 board — 467 MiB RAM, arm64, stock Raspberry Pi OS kernel 6.1.21-v8+. It registers as a node, and a normal alpine pod is created, pulls its image (layer cache hit), and runs, with ordinary `kubectl describe` events — measured 2026-07-08:
+
+```text
+$ sudo apsis status
+Hostname:    engipi
+Pawns:       1
+Pods:        2
+Kernel:      6.1.21-v8+
+Arch:        linux/arm64
+Memory:      177 / 467 MiB
+RSS:         59 MiB
+
+$ free -h
+               total        used        free      shared  buff/cache   available
+Mem:           467Mi       172Mi        87Mi       240Ki   265Mi       294Mi
+```
+
+59 MiB daemon RSS; the whole host with the pod running is ~172 MiB of 467, leaving roughly 294 MiB available. A stock kubelet + containerd pair would not fit alongside a workload on a board this small. Honest caveat: the pod above is on host networking — the multi-pawn CNI path (Constellation) needs kernel 6.6+ for its eBPF datapath, and this board's stock kernel is 6.1; the single-pawn, host-network path is what's verified here. The `go1.26.5` build is a plain cross-compile, nothing arm64-special.
+
 ## Density Run Shape
 
 A representative density run uses one physical host split into many scheduler-visible pawns. Kubernetes places pods across those logical nodes, while the host still supervises workloads as native host-managed workloads.

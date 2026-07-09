@@ -208,7 +208,7 @@ sudo apsis doctor
 ### Requirements
 
 - systemd v250+ (v260+ recommended) and cgroups v2
-- Linux kernel 6.6+ (eBPF features used by the multi-pawn CNI path)
+- Linux kernel 6.6+ for the multi-pawn eBPF CNI path; the single-pawn, host-network path runs on older kernels (verified on 6.1/arm64 — see [benches/README.md](benches/README.md))
 - Kubernetes 1.34+
 - Go 1.26+ to build
 - Optional: the Constellation CNI fork for cross-host networking and multi-pawn isolation; without it, pods use host-network veth bridges (single-pawn only)
