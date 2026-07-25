@@ -98,6 +98,8 @@ Covered behavior:
 - cgroups v2 memory, CPU, IO, PID, etc controls.
 - Per-pod resource limits.
 - Per-pawn capacity budgets.
+- Per-pawn shaping: CPU quota and weight, memory cap, read/write bandwidth limits, swap policy, and topology labels, including their parsing, defaulting, and application to a newly added pawn.
+- Per-pawn log isolation with its own journal namespace and disk cap.
 - Host-level budget protection for co-located services.
 - Node-pressure detection and eviction ordering.
 - Disk-pressure image and layer cleanup paths.

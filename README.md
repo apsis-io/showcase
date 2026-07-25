@@ -6,7 +6,7 @@
 
 Kubernetes has exactly one kubelet. Periapsis is a **second implementation of the Kubernetes node** — it preserves kubelet *semantics* while replacing the CRI execution model with systemd, on the claim that the node is an interface, not a component. It never masquerades as kubelet: events say `perigeos`, the node version says `perigeos://`, and the cluster sees an honest node, not a costume.
 
-Periapsis is a fork of [virtual-kubelet](https://github.com/virtual-kubelet/virtual-kubelet) that absorbs the full **perigeos** stack: a Kubernetes node agent that bypasses the CRI and containerd entirely and runs pods directly on a Linux host as `systemd-nspawn` machines (with host-process and host-runtime WASM launch modes alongside). A single physical host registers as many independent virtual nodes — called **pawns** — each with its own TLS identity, kubelet API endpoint, pod CIDR, and cgroup slice. The scheduler treats them as separate nodes; the workloads stay native units on the host.
+Periapsis is a fork of [virtual-kubelet](https://github.com/virtual-kubelet/virtual-kubelet) that absorbs the full **perigeos** stack: a Kubernetes node agent that bypasses the CRI and containerd entirely and runs pods directly on a Linux host as `systemd-nspawn` machines (with host-process and host-runtime WASM launch modes alongside). A single physical host registers as many independent virtual nodes — called **pawns** — each with its own TLS identity, kubelet API endpoint, pod CIDR, and cgroup slice, and each shaped independently (a compute pawn, an I/O-capped storage pawn, a memory-heavy pawn, on one box). The scheduler treats them as separate nodes; the workloads stay native units on the host.
 
 This public repository is intentionally information-only. It contains public project material, test-surface summaries, and benchmark summaries. It does not contain source code, ADRs, or operational secrets (for now, expect a release in around 2 to 3 months).
 
@@ -102,7 +102,23 @@ engix99-trail-2    256    2     2G
 
 One host's first node takes the host's own name and the **`primary`** role; it carries the host-level duties, including any static pods and the self-hosted control plane. Additional nodes on that host register as ordinary **`pawn`** nodes. Above the node boundary nothing can tell them apart from hardware nodes except the honest `perigeos://` version string.
 
-Two structural points that are easy to get wrong:
+Three structural points that are easy to miss:
+
+**Pawns are shaped, not uniform.** A pawn is not just "a fraction of the host" — each one is sized and specialised independently, so a single machine can present a *heterogeneous* set of nodes: a compute pawn, an I/O-capped pawn, a storage pawn, a memory-heavy pawn, on the same box at the same time. What can differ per pawn:
+
+| Knob | Effect |
+|---|---|
+| CPU quota and CPU weight | hard cap plus relative priority under contention — a compute pawn can be given the CPU that's left when others are idle, without being able to starve them |
+| Memory cap | the pawn's slice, enforced as `MemoryMax` on the parent cgroup |
+| Read / write bandwidth caps | cgroup-v2 IO limits on the pawn's slice, so an I/O-heavy tenant can't saturate the disk out from under the rest of the host |
+| Swap policy | swap allowed, sized, or refused per pawn, overriding the host default |
+| Topology (`region` / `zone`) | drives `topologySpreadConstraints` and zone-aware affinity |
+| Labels and taints | how workloads are actually routed to the right shape |
+| Log isolation | each pawn can own a dedicated `journald` namespace with its own disk cap, so a runaway pod floods its own pawn's journal and neither the host's nor another pawn's |
+
+The routing needs nothing custom: label a pawn and taint it, and ordinary `nodeSelector`, affinity, and tolerations do the rest — the scheduler is choosing between nodes, and these are nodes. That is the part a stock kubelet structurally cannot do. One kubelet is one node with one flat capacity profile and one shared IO and log domain; splitting a host into a fast compute node and a bandwidth-capped storage node means either buying a second machine or paying for a VM layer to fake one.
+
+Two honest limits on that. The shaping is cgroup enforcement, not hardware partitioning — a bandwidth cap is `io.max` on a slice, not a dedicated controller. And the topology override lets you *model* zones, so it should describe real failure domains rather than manufacture them; pawns on one host are not independent no matter what zone label they carry (see below).
 
 **One daemon, many nodes.** Pawns are not one process each — a single `perigeos` process serves every pawn on the host, which is why idle overhead grows so slowly with pawn count (see the RSS figures in [benches/README.md](benches/README.md)). Pawn count is a configuration choice rather than a property of the hardware, and it is changeable at runtime: `apsis pawns add`, `resize`, and `scale` reshape a live host's node topology without restarting the daemon, and `apsis pawns remove --drain` cordons and evicts a pawn's pods before retiring it. A shrink that would fall below what its pods have already been promised is refused rather than silently overcommitted.
 
@@ -176,7 +192,7 @@ See [benches/README.md](benches/README.md) for the public benchmark notes, inclu
 
 Periapsis fits trusted, density-first deployments where the CRI / microVM tax is the bottleneck.
 
-- **A real multi-node cluster on one machine** — instead of `minikube` / `kind` / `k3d` (a single node, or nodes faked as nested containers), one host registers as 30+ pawns, so you can exercise what a single-node dev cluster can't: scheduling and (anti-)affinity, topology spread, `NetworkPolicy` and Services *across nodes*, PodDisruptionBudgets, and node cordon/drain — on a laptop or one server.
+- **A real multi-node cluster on one machine** — instead of `minikube` / `kind` / `k3d` (a single node, or nodes faked as nested containers), one host registers as 30+ pawns, so you can exercise what a single-node dev cluster can't: scheduling and (anti-)affinity, topology spread, `NetworkPolicy` and Services *across nodes*, PodDisruptionBudgets, and node cordon/drain — on a laptop or one server. Because pawns are shaped independently, you can also reproduce a *heterogeneous* cluster — a fast compute node next to a bandwidth-starved storage node next to a 512 MB edge node — and find out how a workload behaves there before it meets real hardware.
 - **High-density CI/CD and batch** — thousands of short-lived build/test pods with no containerd shim per pod; a pod is a transient `systemd-nspawn` unit, so per-pod overhead is sub-MB and churn is cheap.
 - **Edge & small VPS** — the stock kubelet+containerd stack is heavy before any workload runs; a single-pawn Periapsis daemon idles in the 70–130 MB range and leaves the box for the workload (plus the WASM (WASIp3 components) `runtimeClass` path for tiny, sandboxed edge workloads).
 - **Homelab / bare-metal saturation** — fill a big Xeon/Threadripper box past the 110-pod cap without underutilising it or adding the KubeVirt/Kata microVM latency and memory tax. Co-exists with an existing k3s/kubelet node on the same host.
