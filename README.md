@@ -192,7 +192,7 @@ See [benches/README.md](benches/README.md) for the public benchmark notes, inclu
 
 Periapsis fits trusted, density-first deployments where the CRI / microVM tax is the bottleneck.
 
-- **A real multi-node cluster on one machine** — instead of `minikube` / `kind` / `k3d` (a single node, or nodes faked as nested containers), one host registers as 30+ pawns, so you can exercise what a single-node dev cluster can't: scheduling and (anti-)affinity, topology spread, `NetworkPolicy` and Services *across nodes*, PodDisruptionBudgets, and node cordon/drain — on a laptop or one server. Because pawns are shaped independently, you can also reproduce a *heterogeneous* cluster — a fast compute node next to a bandwidth-starved storage node next to a 512 MB edge node — and find out how a workload behaves there before it meets real hardware.
+- **A real multi-node cluster on one machine** — one host registers as 30+ independent pawns, so a laptop or a single server can exercise the cross-node scheduling, networking, and disruption behaviour a single-node dev cluster cannot. And because pawns are shaped independently, it can be a *heterogeneous* cluster — a fast compute node beside a bandwidth-starved storage node beside a 512 MB edge node — so a workload meets that shape before real hardware does. (Compared against `minikube` / `kind` / `k3d` under [Comparisons](#comparisons).)
 - **High-density CI/CD and batch** — thousands of short-lived build/test pods with no containerd shim per pod; a pod is a transient `systemd-nspawn` unit, so per-pod overhead is sub-MB and churn is cheap.
 - **Edge & small VPS** — the stock kubelet+containerd stack is heavy before any workload runs; a single-pawn Periapsis daemon idles in the 70–130 MB range and leaves the box for the workload (plus the WASM (WASIp3 components) `runtimeClass` path for tiny, sandboxed edge workloads).
 - **Homelab / bare-metal saturation** — fill a big Xeon/Threadripper box past the 110-pod cap without underutilising it or adding the KubeVirt/Kata microVM latency and memory tax. Co-exists with an existing k3s/kubelet node on the same host.
@@ -249,21 +249,7 @@ nginx-whoami-758f9d579-x69vp   1/1     Running   1 (13h ago)   5d10h
 
 Alongside the automatic path, an operator can drive it directly: `apsis sunset` / `dawn` (idle and wake), `apsis freeze` / `thaw` (the freezer tier), and wall-time / CPU-time budgets (`apsis budget`, `apsis fuel`) that force a pod idle once it has consumed its allowance.
 
-### vs Knative
-
-The shared premise is the same: a pod nobody is talking to should collapse. The mechanism is not.
-
-Knative Serving takes the Revision's Deployment to zero replicas, and the ReplicaSet deletes the pod outright. The next request therefore builds a **new** pod — new UID, new IP, a trip through the scheduler, CNI IPAM from scratch. In Knative's model, "collapsing" a pod *is* deleting it.
-
-In Periapsis the pod object never goes away. A frozen pod is the same process taken off the CPU; an idled pod is the same pod with its process stopped — same UID, same IP, same network namespace, image already local, scheduler not involved. That is what the ~1.4–1.6 s figure describes, over 9 clean cycles.
-
-**No Knative number is quoted next to it, deliberately.** There is no reproducible measurement of Knative taken on this hardware, and published cold-start benchmarks depend far too much on configuration to make an honest side-by-side. The two are structurally different operations regardless: one resumes an existing pod, the other assembles a new one.
-
-**Both have an activator. They are opposite designs.** Knative's sits *in* the request path: traffic for a scaled-to-zero Revision is routed to the activator, which holds the request until a pod is ready and then proxies it through — plus a queue-proxy sidecar riding along in every pod. Periapsis's activator never sees a packet. It is a node-side control agent driving the eBPF program on the datapath that is already there: per-pod-IP flow counters feed idle detection, and a SYN to an idled pod's IP is caught, reported, and dropped, so **the client's own TCP retransmit is the buffer** — nothing holds the connection, and no proxy is added anywhere.
-
-That is a deliberate trade, and it was taken the other way first: an earlier design did put an in-path L7 activator in front of every app, and it was rejected because a userspace hop that exists purely for the cold case gets paid on 100% of traffic, warm requests included. The price of the current design is exactly the retransmit quantization described above — a coarser wake, in exchange for zero cost on every warm request.
-
-They also aren't substitutes. Knative is a portable serving layer *above* the node — revisions, traffic splitting, request-driven replica autoscaling, eventing — and it runs on any conformant cluster. Periapsis's version is a node-level primitive on ordinary pods: no new API objects, no per-pod sidecar, no ingress dependency, but equally no revision model and no replica autoscaling, and it needs Periapsis nodes. Nothing structural stops Knative from running on top of Periapsis nodes, since everything above the node boundary is ordinary Kubernetes — though that combination hasn't been validated here.
+How this differs from Knative's scale-to-zero — a different mechanism, not a different tuning — is in [Comparisons](#comparisons) below.
 
 **WASM (Trail) workloads** — a pod with `runtimeClassName: trail` runs a WASIp3 **component** via the **host-runtime path**: a transient unit joined to the pod netns, `wasi:sockets` bound on the pod IP (a WASM runtimeClass with no installed runtime fails closed). Bare wasip1 CLI runtimes (running a raw core module with no component model, no host-capability profile, no checkpoint/restore) are deliberately not supported in favor of Trail's component path; `trail` is the only WASM runtimeClass today (earlier separate `wasmtime`/`wasmedge`/`wasmer` classes have been consolidated into it).
 
@@ -341,6 +327,72 @@ Static pods carry extra durability rules so the control plane can never eat itse
 - **VolumeSnapshot**: works via the CSI/PVC path.
 
 Periapsis can **coexist** with a standard kubelet or k3s node on the same cluster. Standard CNIs (Calico, Flannel, upstream Cilium) work for 1:1 node-to-host deployments; multiplexing one host into multiple pawns ("pawn slicing") requires the Constellation CNI fork.
+
+---
+
+## Comparisons
+
+What this is *not*, working from the neighbouring layers of the stack inward to the comparison that matters.
+
+### vs k3s
+
+k3s is a compact **control plane** — one binary, kine instead of etcd — but its node is the vanilla one: kubelet plus containerd, and the same 110-pod ceiling. k3s solves cluster *installation*; Periapsis solves the *node*.
+
+It now does the former as well: `perigeos` cold-starts its own apiserver, controller-manager, and scheduler from kubeadm-style static manifests, so nothing has to keep running as a permanent orchestrator underneath. The manifest format stays; the standing dependency goes. Validated on a clean 1 vCPU / 2 GB VPS that had never seen the project: control plane plus kube-proxy, CoreDNS, and a workload fit in roughly 523 MB, came up end to end, and served real external requests through a NodePort.
+
+So the boundary here isn't hard. Run k3s in front of Periapsis nodes exactly as before, or don't run it at all.
+
+### vs LXC / Incus
+
+Incus is a system container manager in its own right, with no Kubernetes above it: its own CLI, its own API, its own model of profiles and networks.
+
+Periapsis uses a similar isolation primitive — namespaces and cgroups via `systemd-nspawn`, the same class of thing as LXC — but remains a **Kubernetes node**: the same API server, the same scheduler, Deployments, Services, NetworkPolicy, and the whole existing toolchain and YAML ecosystem people already know. The difference isn't the isolation. It's what sits on top of it.
+
+### vs minikube / kind / k3d
+
+A single-node cluster on a laptop — or a pod-in-pod one, as with kind and k3d — is good for checking that a manifest applies. It is not good for checking the things Kubernetes exists for in the first place: how (anti-)affinity behaves, topology spread, Service and NetworkPolicy and CNI *between* nodes, or a PodDisruptionBudget under a real cordon and drain.
+
+One Periapsis host registers as 30+ independent pawns. That is an actual multi-node cluster to test against, not one node wearing several names — and since [pawns are shaped independently](#what-a-pawn-is), it can be a *heterogeneous* one.
+
+### vs Knative
+
+The shared premise is the same: a pod nobody is talking to should collapse. The mechanism is not.
+
+Knative Serving takes the Revision's Deployment to zero replicas, and the ReplicaSet deletes the pod outright. The next request therefore builds a **new** pod — new UID, new IP, a trip through the scheduler, CNI IPAM from scratch. In Knative's model, "collapsing" a pod *is* deleting it.
+
+In Periapsis the pod object never goes away. A frozen pod is the same process taken off the CPU; an idled pod is the same pod with its process stopped — same UID, same IP, same network namespace, image already local, scheduler not involved. That is what the ~1.4–1.6 s figure describes, over 9 clean cycles.
+
+**No Knative number is quoted next to it, deliberately.** There is no reproducible measurement of Knative taken on this hardware, and published cold-start benchmarks depend far too much on configuration to make an honest side-by-side. The two are structurally different operations regardless: one resumes an existing pod, the other assembles a new one.
+
+**Both have an activator. They are opposite designs.** Knative's sits *in* the request path: traffic for a scaled-to-zero Revision is routed to the activator, which holds the request until a pod is ready and then proxies it through — plus a queue-proxy sidecar riding along in every pod. Periapsis's activator never sees a packet. It is a node-side control agent driving the eBPF program on the datapath that is already there: per-pod-IP flow counters feed idle detection, and a SYN to an idled pod's IP is caught, reported, and dropped, so **the client's own TCP retransmit is the buffer** — nothing holds the connection, and no proxy is added anywhere.
+
+That is a deliberate trade, and it was taken the other way first: an earlier design did put an in-path L7 activator in front of every app, and it was rejected because a userspace hop that exists purely for the cold case gets paid on 100% of traffic, warm requests included. The price of the current design is exactly the retransmit quantization described above — a coarser wake, in exchange for zero cost on every warm request.
+
+They also aren't substitutes. Knative is a portable serving layer *above* the node — revisions, traffic splitting, request-driven replica autoscaling, eventing — and it runs on any conformant cluster. Periapsis's version is a node-level primitive on ordinary pods: no new API objects, no per-pod sidecar, no ingress dependency, but equally no revision model and no replica autoscaling, and it needs Periapsis nodes. Nothing structural stops Knative from running on top of Periapsis nodes, since everything above the node boundary is ordinary Kubernetes — though that combination hasn't been validated here.
+
+### vs runwasi
+
+runwasi is a containerd v2 shim: it runs a Wasm module in place of an ordinary OCI container, but stays **inside** the CRI / containerd / shim architecture — the same process-per-workload, the same layer this project removes, just with a Wasm runtime behind it instead of runc.
+
+Here the same job is `runtimeClassName: trail`: a WASIp2/p3 component executed directly by the host runtime, joined to the pod's network namespace. No shim, no extra process per workload. It is the same argument as the rest of this project — nothing between the declared state and the process on the host — applied to Wasm rather than to OCI containers.
+
+### vs kubelet
+
+This is the comparison that matters; everything above is a neighbouring layer.
+
+One container's path on a standard node: **kubelet → CRI → containerd → containerd-shim → runc → process.** Every layer has its own process, its own state, its own restart, and its own bugs. The same container's path here: **perigeos → D-Bus → systemd → process** — and in that chain perigeos is not the supervisor but the *declarer*. It tells systemd what should be running and steps back to watch.
+
+Almost everything else falls out of that one subtraction, and most of it did not have to be *built*:
+
+- Logs aren't gathered by an agent tailing text files — they are already in `journald`, because a pod is a unit.
+- Restarts and backoff aren't implemented in the daemon — they are `Restart=` and `RestartSec=`, because a pod is a unit.
+- Zero-downtime daemon upgrade isn't a mechanism but a consequence of `KillMode=process`: pods are children of systemd, not of perigeos, so restarting the daemon simply doesn't concern them.
+- Visibility doesn't need `crictl` — `machinectl` and `systemctl` show pods, because pods have nothing to hide: they are ordinary nspawn machines.
+- "A node is a machine" stops being a law of nature — 30 pawns on one host are 30 cgroup slices with their own certificates.
+
+A kubelet does all of this too, at the cost of that layer: three daemons, a shim per container, its own log pipeline, and its own supervisor stacked on the supervisor every OS already ships. That's where the numbers in [Why](#why) come from — not "we optimised kubelet", but "we removed what it was obliged to carry".
+
+And to be entirely fair: **kubelet is not a mistake.** It was designed when "node" meant "physical machine", Docker was the only runtime, and systemd could not do half of what it does now. It made containers a boring, dependable technology, and it has earned a monument. A monument just doesn't have to stand on every node and eat half a gigabyte of memory.
 
 ---
 
