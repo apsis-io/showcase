@@ -13,7 +13,10 @@ Periapsis benchmarks focus on density and host overhead rather than synthetic mi
 - Pod create/delete churn.
 - Daemon restart behavior while pods continue running.
 - Image pull and peer-assisted distribution behavior.
-- WASIp2 HTTP workload throughput when using the Trail host runtime.
+- WASIp2/p3 HTTP workload throughput when using the Trail host runtime.
+- Idle-to-wake latency for scale-to-zero pods.
+- Traffic continuity across a daemon restart under load.
+- Time from a local artifact to a pod serving real traffic.
 
 ## Representative Results
 
@@ -30,6 +33,51 @@ The following numbers are public snapshot figures from development and validatio
 | Small-fleet HTTP latency (2026-07-06, 7 nodes / 21 pods, 2,910 req/s) | p95 1.36 ms, p99 sub-millisecond, 0% errors |
 
 The small-fleet latency figure is a fresh data point, not a direct comparison to the WASIX-era throughput sample above — different fleet size, workload, request rate, and (by now) a different runtime class entirely. It shouldn't be read as an improvement claim over any prior measurement.
+
+## Scale-To-Zero Wake Latency (2026-07-06)
+
+An idled ("sunset") pod keeps its network namespace, address, and overlay rootfs while its memory is reclaimed, so waking it is a warm start rather than a fresh schedule. Measured over 9 clean idle/wake cycles on one pawn, timed both externally around the wake call and by the daemon's own self-reported wake time (the two agreed within ~30 ms every cycle):
+
+| Metric | Result |
+| --- | --- |
+| Wake latency (idled → serving again) | **1.43–1.58 s**, 9 samples, tight |
+| Idle → confirmed stopped | 5.15–5.34 s, bounded by the fixture's 5 s termination grace period |
+| Cold start for comparison (delete → replacement pod Ready) | bimodal, ~2.0 s or ~5.3–5.7 s, 5 samples |
+
+Honest caveats: small sample sizes — enough for an order of magnitude and to confirm consistency, not a rigorous distribution. All samples are same-node; no cross-node numbers were taken. The cold-start bimodality was not root-caused; the plausible-but-unverified guess is network-resource reuse waiting on the old pod's full teardown. The idle-to-stopped figure is dominated by the test workload ignoring `SIGTERM`, not by Periapsis.
+
+## Daemon Restart Under Load (2026-07-08)
+
+Because pods are `systemd-nspawn` machines rather than children of the node agent, restarting or upgrading the daemon should not touch running workloads. Measured against a 3-replica nginx Deployment behind a Service, with the daemon restarted mid-flood:
+
+| Metric | Result |
+| --- | --- |
+| Load at restart | 300 concurrent VUs, ~1,490 req/s steady state |
+| Completed iterations | 107,631 |
+| Interrupted iterations (real failures) | **0** |
+| Pod container restarts | **0** |
+| Pod readiness across the restart | stayed Ready throughout |
+| Daemon restart window | ~5 s |
+
+Two caveats worth stating plainly. First, this is a single-host result and the run was stopped early (~82 s) once the outcome was unambiguous — it is not a long-soak number. Second, an earlier round of the same test at light load (20 VUs) reported "0 interrupted iterations" and was **misleading**: the restart had silently broken the pods' readiness probes, and the symptom simply hadn't surfaced yet within the short observation window. That bug — a probe path reading a pod IP from an in-memory cache that did not survive a process restart, with no fallback to the pod's recorded status IP — was found, fixed, and unit-tested; the three affected pods recovered on their own within seconds of the fixed binary starting, with no restarts or recreation. The clean result above is from after the fix. The light-load round is kept in the record as a cautionary example of a benchmark that measured the wrong thing.
+
+## Local Artifact To Serving Traffic (2026-07-22)
+
+Because a node can ingest an artifact directly into its library and serve it peer-to-peer, there is a path from a file on disk to a running workload that involves no registry, no image build, and no CI. Measured with a wall clock on each leg, two consecutive runs, for a 3.4 MB WASM component:
+
+| Leg | Run A | Run B |
+| --- | --- | --- |
+| Ingest (raw component → cluster-available, pinned, P2P-served) | 0.13 s | 0.13 s |
+| Manifest apply | 0.22 s | 0.22 s |
+| Apply → pod Running | 1.10 s | 1.04 s |
+| Running → first HTTP 200 with a real page body | 0.11 s | 0.11 s |
+| **Total: local file → serving traffic** | **1.57 s** | **1.51 s** |
+
+This is a small artifact on a warm host, and the response body was verified to be the application's real page rather than a probe artifact. It measures the distribution and launch path, not application startup for a heavyweight service.
+
+## Cross-Architecture Migration (2026-07-09)
+
+A checkpoint-capable WASM component pod was migrated from an amd64 node to an arm64 node with its in-memory state intact and no manual intervention: the target resolved and fetched the component image peer-to-peer, restored the checkpoint, and resumed with its counter continuing rather than resetting. This is a capability result rather than a timing benchmark; no latency distribution was collected.
 
 ## Resource Consumption Snapshot (Small Deployment)
 

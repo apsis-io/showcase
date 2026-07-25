@@ -4,6 +4,8 @@
 
 **A high-density Kubernetes node agent that runs pods as `systemd-nspawn` machines, not CRI containers.**
 
+Kubernetes has exactly one kubelet. Periapsis is a **second implementation of the Kubernetes node** — it preserves kubelet *semantics* while replacing the CRI execution model with systemd, on the claim that the node is an interface, not a component. It never masquerades as kubelet: events say `perigeos`, the node version says `perigeos://`, and the cluster sees an honest node, not a costume.
+
 Periapsis is a fork of [virtual-kubelet](https://github.com/virtual-kubelet/virtual-kubelet) that absorbs the full **perigeos** stack: a Kubernetes node agent that bypasses the CRI and containerd entirely and runs pods directly on a Linux host as `systemd-nspawn` machines (with host-process and host-runtime WASM launch modes alongside). A single physical host registers as many independent virtual nodes — called **pawns** — each with its own TLS identity, kubelet API endpoint, pod CIDR, and cgroup slice. The scheduler treats them as separate nodes; the workloads stay native units on the host.
 
 This public repository is intentionally information-only. It contains public project material, test-surface summaries, and benchmark summaries. It does not contain source code, ADRs, or operational secrets (for now, expect a release in around 2 to 3 months).
@@ -44,6 +46,34 @@ Periapsis can also go a step further and bootstrap the control plane itself: `pe
 
 ---
 
+## Conformance
+
+"It satisfies the node contract" is a claim that has to be *measured*, not asserted. Periapsis is validated against the **upstream Kubernetes end-to-end node suite** — the same Ginkgo specs the project ships to certify a kubelet, run unmodified against a real cluster with the version-matched `v1.36` e2e binary, pointed at pawn nodes.
+
+Latest tracked run (2026-07-25), across all specs run to date:
+
+| | |
+|---|---|
+| Distinct specs run | **752** |
+| Passing | **657** |
+| Actionable failures | **0** |
+| Deferred (real gaps, consciously postponed) | 3 |
+| Ignored (non-actionable) | 92 |
+
+The three **deferred** specs are one CSI feature (per-pod service-account-token plumbing through `NodePublishVolume`) that is in scope and simply not on the current worklist.
+
+The 92 **ignored** specs are excluded with a written reason each, and the reasons are of three kinds:
+
+- **Off-by-default feature gates** that the cluster under test doesn't enable (e.g. `PodCertificateRequest`, alpha pod-level-resources resize), so the spec cannot run meaningfully either way.
+- **Control-plane concerns that aren't a node's job** — kubeadm bootstrap-token behaviour, API-server storage/chunking semantics.
+- **Identity divergences** — specs that assert the node is *literally* a kubelet: kubelet-branded metric names, kubelet-internal cgroup layout, and version-skew artifacts where an upstream release renamed a spec family. Periapsis deliberately does not pretend to be kubelet, so these fail by design rather than by defect; each one is recorded with what it asserts and why the divergence is intentional.
+
+Selected results worth calling out: the in-place pod resize family (KEP-1287) is **9/9** on v1.36 — app containers, native sidecars, running plain init containers, and rollback — with a running container's cgroup limits moved live and `status.containerStatuses[].resources` reflecting the enacted value.
+
+Conformance is tracked as a living artifact in the private tree (a per-spec verdict table regenerated from the JUnit output of every run, most-recent-run-wins), not as a one-off screenshot. Numbers above are a snapshot of that table.
+
+---
+
 ## Why
 
 A stock kubelet carries a hard **110-pod ceiling** and the weight of containerd plus a runc shim *per container*. On powerful hardware that forces a choice between underutilising the box and adding a hypervisor layer (KVM / KubeVirt / Kata) that pays a microVM tax in memory, boot latency, and jitter. On a small VPS or edge machine the standard stack is heavy before a single workload runs.
@@ -70,7 +100,7 @@ Periapsis fits trusted, density-first deployments where the CRI / microVM tax is
 
 - **A real multi-node cluster on one machine** — instead of `minikube` / `kind` / `k3d` (a single node, or nodes faked as nested containers), one host registers as 30+ pawns, so you can exercise what a single-node dev cluster can't: scheduling and (anti-)affinity, topology spread, `NetworkPolicy` and Services *across nodes*, PodDisruptionBudgets, and node cordon/drain — on a laptop or one server.
 - **High-density CI/CD and batch** — thousands of short-lived build/test pods with no containerd shim per pod; a pod is a transient `systemd-nspawn` unit, so per-pod overhead is sub-MB and churn is cheap.
-- **Edge & small VPS** — the stock kubelet+containerd stack is heavy before any workload runs; a single-pawn Periapsis daemon idles in the 70–130 MB range and leaves the box for the workload (plus the WASM (WASIp2 components) `runtimeClass` path for tiny, sandboxed edge workloads).
+- **Edge & small VPS** — the stock kubelet+containerd stack is heavy before any workload runs; a single-pawn Periapsis daemon idles in the 70–130 MB range and leaves the box for the workload (plus the WASM (WASIp3 components) `runtimeClass` path for tiny, sandboxed edge workloads).
 - **Homelab / bare-metal saturation** — fill a big Xeon/Threadripper box past the 110-pod cap without underutilising it or adding the KubeVirt/Kata microVM latency and memory tax. Co-exists with an existing k3s/kubelet node on the same host.
 
 It is the **wrong** tool for hostile multi-tenancy: pods share the host kernel, so untrusted code that can exploit a kernel bug is out of scope — reach for a microVM runtime there.
@@ -87,8 +117,9 @@ It is the **wrong** tool for hostile multi-tenancy: pods share the host kernel, 
 - Create / update / delete; restart policies; CrashLoopBackOff (systemd owns the restart, the FSM observes).
 - Init containers, native sidecars (init w/ `restartPolicy: Always`), and liveness / readiness / startup probes (exec, httpGet, tcpSocket, grpc).
 - postStart / preStop lifecycle hooks with a shared grace budget and a hard SIGKILL-at-grace cap.
-- Pod phases, conditions, `terminationMessage`, OOMKilled detection (including nested-cgroup payload OOMs), signal exit codes.
+- Pod phases, conditions (including `PodReadyToStartContainers`), `terminationMessage`, OOMKilled detection (including nested-cgroup payload OOMs), signal exit codes.
 - Restart durability: the reconciler's plan position is snapshotted and restored, so a running pod survives a daemon restart with no `Pending` flap.
+- `sd_notify` from pod workloads: a systemd-native service inside a pod can report readiness over `NOTIFY_SOCKET` — no CRI equivalent exists.
 
 **Security** — full SecurityContext support; fields perigeos can't honour faithfully are *rejected* at config build (a `FailedCreateContainerConfig` warning event in `kubectl describe`) rather than silently mis-launched.
 
@@ -104,18 +135,40 @@ root:2000 drwxrwsr-x                       # fsGroup owns the volume, setgid bit
 
 **Resources & containment**
 - `resources.limits` become real cgroup-v2 caps (`memory.max` / `cpu.max` / `pids.max`), not scheduler hints — an over-limit container is contained, not the host.
+- **In-place pod resize (KEP-1287)**: a running container's CPU/memory limit is moved on its live cgroup without a restart (`resizePolicy: NotRequired`), or with a deliberate restart where the policy asks for one — for app containers, native sidecars, and running init containers alike, with a `ResizeCompleted` event and enacted values in the pod status. **Pod-level resources** (the pod-scoped `spec.resources`) and pod-level resize are supported too, and the node advertises the matching feature so the scheduler can rely on it.
 - Per-pod PID cap / fork-bomb containment (`periapsis.io/max-pids`).
 - Node-pressure eviction ranked kubelet-style (QoS → priority → usage); disk-pressure image/layer GC before pod eviction.
-- Per-pawn slice caps and a per-host budget cap, leaving headroom for a co-located real kubelet. **Dynamic pawn scaling** from the budget: `apsis pawns scale <set> <count>` reconciles a pawn set to a target count, sizing each pawn to an even share of the host budget.
+- Per-pawn slice caps and a per-host budget cap, leaving headroom for a co-located real kubelet. **Dynamic pawn scaling** from the budget: `apsis pawns scale <set> <count>` reconciles a pawn set to a target count, sizing each pawn to an even share of the host budget; `apsis pawns add` / `resize` / `remove --drain` change a live host's node topology without a restart.
+- Opt-in **KSM memory dedup** per pod (`periapsis.io/memory-ksm`) — many near-identical pods on one host share identical pages.
 
-**WASM (Trail) workloads** — a pod with `runtimeClassName: trail` runs a WASIp2/p3 **component** via the **host-runtime path**: a transient unit joined to the pod netns, `wasi:sockets` bound on the pod IP (a WASM runtimeClass with no installed runtime fails closed). Bare wasip1 CLI runtimes (running a raw core module with no component model, no host-capability profile, no checkpoint/restore) are deliberately not supported in favor of Trail's component path; `trail` is the only WASM runtimeClass today (earlier separate `wasmtime`/`wasmedge`/`wasmer` classes have been consolidated into it).
+**Idle & wake (scale-to-zero)** — a pod annotated for scale-to-zero idles after an inactivity window: the app container is stopped and its memory reclaimed, while the netns, pod IP, and overlay rootfs are retained, so the pod stays routable and its restart is a warm start rather than a fresh schedule. An incoming connection wakes it through an eBPF trap on the pod IP; the pod is reported in an `Idled` phase meanwhile. Measured wake latency is **~1.4–1.6 s**, consistently (see [benches/README.md](benches/README.md)).
 
 ```text
-$ kubectl logs hello-wasm                  # runtimeClassName: trail, a WASIp2 component
+$ kubectl get pods -n nginx-demo
+NAME                           READY   STATUS    RESTARTS      AGE
+nginx-whoami-758f9d579-nd2gw   0/1     Idled     0             5d10h   # RAM freed, IP retained
+nginx-whoami-758f9d579-x69vp   1/1     Running   1 (13h ago)   5d10h
+```
+
+Alongside the automatic path, an operator can drive it directly: `apsis sunset` / `dawn` (stop and warm-start), `apsis freeze` / `thaw` (cgroup-v2 freezer — the *same* process suspended and resumed, not a cold start), and wall-time / CPU-time budgets (`apsis budget`, `apsis fuel`) that force a pod idle once it has consumed its allowance.
+
+**WASM (Trail) workloads** — a pod with `runtimeClassName: trail` runs a WASIp3 **component** via the **host-runtime path**: a transient unit joined to the pod netns, `wasi:sockets` bound on the pod IP (a WASM runtimeClass with no installed runtime fails closed). Bare wasip1 CLI runtimes (running a raw core module with no component model, no host-capability profile, no checkpoint/restore) are deliberately not supported in favor of Trail's component path; `trail` is the only WASM runtimeClass today (earlier separate `wasmtime`/`wasmedge`/`wasmer` classes have been consolidated into it).
+
+```text
+$ kubectl logs hello-wasm                  # runtimeClassName: trail, a WASIp3 component
 hello from wasm
 ```
 
-**Networking** — a Cilium-based CNI fork ("Constellation") for the multi-pawn case: eBPF datapath, VXLAN cross-host routing, per-pod netns. Standard CNI (`/etc/cni/net.d`) covers standalone 1:1 host-to-node deployments. Cluster DNS, `dnsConfig`/`dnsPolicy`, managed `/etc/hosts` + `hostAliases`. Pod-to-pod (same/cross host), ClusterIP Services across hosts, NetworkPolicy, and L7 ingress all work with pawn-hosted workloads.
+Trail is **deny-by-default**: a component gets no filesystem, no network, no environment, and no host capability unless the pod grants it, one annotation per capability, with node-wide default and ceiling policies that apply even to a pod that asks for nothing. An un-granted import fails closed rather than silently succeeding.
+
+Two capabilities of the component model that a container runtime structurally cannot offer:
+
+- **Composition at launch.** A component's WIT imports can be satisfied by fusing a provider into a single component at launch, by plugging one in-process with live hot-swap (`apsis pods swap-plug`, no consumer restart), or by binding to a provider running on *another node* — with a scheduler moving a workload between those tiers from live traffic signals.
+- **Cross-architecture live migration.** A component that exports the checkpoint contract can be moved to another node — **including a node of a different CPU architecture** — with its in-memory state intact, via `apsis pods migrate <pod> --to <node>`: the source is checkpointed on a coordinated stop, the bytes are relayed, and the target restores and resumes. A `.wasm` component has no per-architecture build, so a cross-ISA move is the same mechanism as a same-host one. Live-validated **amd64 → arm64** (2026-07-09), with the target resolving the component image peer-to-peer and the counter continuing rather than resetting.
+
+Checkpoint/restore here is *cooperative* by design — the component serializes its own state through a WIT seam — rather than an attempt to snapshot the engine's execution state, which a feasibility study found infeasible for components in the first place.
+
+**Networking** — [Constellation](https://github.com/malformed-c/constellation), a Cilium CNI fork, for the multi-pawn case: eBPF datapath, VXLAN cross-host routing, per-pod netns. Standard CNI (`/etc/cni/net.d`) covers standalone 1:1 host-to-node deployments. Cluster DNS, `dnsConfig`/`dnsPolicy`, managed `/etc/hosts` + `hostAliases`. Pod-to-pod (same/cross host), ClusterIP Services across hosts, NetworkPolicy, and Envoy Gateway L7 ingress all work with pawn-hosted workloads. Pods with a conflicting `hostPort` are rejected at admission the way a kubelet rejects them, rather than failing later at launch.
 
 ```text
 # NetworkPolicy enforcement (server + client on different pawns):
@@ -143,17 +196,26 @@ Normal  PulledFromPeer     pod/wasix-engifire  Layer a03d287ccca9 pulled from pe
 Normal  Started            pod/wasix-engifire  Container server started
 ```
 
-Pull policies, `imagePullSecrets`, and digest verification are supported. **`apsis ingest`** loads an OCI/docker image tar straight into a node's library — served P2P, usable by pods, pinned against GC — so an image reaches the cluster with no registry. For WebAssembly, it also accepts a raw `.wasm` or `.wat` program and packs it as a minimal WASM OCI image automatically.
+Pull policies, `imagePullSecrets`, and digest verification are supported. **`apsis ingest`** loads an OCI/docker image tar straight into a node's library — served P2P, usable by pods, pinned against GC — so an image reaches the cluster with no registry. It also accepts a raw `.wasm`/`.wat` component or a native ELF binary and packs it into a minimal runnable image automatically. Measured end to end (2026-07-22): a 3.4 MB `.wasm` file on disk to a pod serving real HTTP traffic in **~1.5 s** — no Dockerfile, no registry, no CI.
 
 The layer cache is **garbage-collected** automatically: under disk pressure perigeos reclaims orphaned layers, then evicts whole unused (not running, not pinned) images LRU before falling back to evicting pods — plus `apsis cleanup` / `apsis images rm` on demand.
 
-**Storage** — `configMap`, `secret`, `projected` (incl. rotated serviceAccountToken), `emptyDir` (incl. `medium: Memory`), `downwardAPI`, `hostPath`, and PVC/CSI.
+**Storage** — `configMap`, `secret`, `projected` (incl. rotated serviceAccountToken), `emptyDir` (incl. `medium: Memory`), `downwardAPI`, `hostPath`, PVC/CSI (including CSI-requested service-account tokens and node volume expansion), and **image volumes** (KEP-4639) — an OCI image mounted as a read-only volume rather than run as a container.
+
+**Self-hosted control plane** — Periapsis can host the control plane it registers with: `kube-apiserver`, controller-manager, and scheduler as static pods on the primary pawn, backed by SQLite instead of an etcd cluster. The chicken-and-egg (the node agent must start the API server it needs) is resolved explicitly rather than by luck:
+
+- **Cold bootstrap** — on a fresh host, or one whose control plane is down, the daemon runs a minimal API-server-independent pipeline whose only job is launching the static pods; while it makes progress it keeps extending its own systemd start timeout, the systemd-native way to say "still coming up" for a phase with no fixed upper bound. Once the API server answers, the same process registers each static pod into the API, re-admits it under its real API-assigned UID, and hands off to normal reconciliation.
+- **Warm start** — with a control plane already up, the daemon boots straight into normal mode and *adopts* what is already running, rather than restarting it.
+- **Host reboot** — the daemon observes that believed-alive machines are gone and relaunches them, entering cold bootstrap first if the reboot took the API server down too. The control plane self-heals up, then the workloads follow; no manual sequence and no external orchestrator.
+
+Static pods carry extra durability rules so the control plane can never eat itself: they are exempt from orphan reaping and immune to scale-to-zero idling, and structural or resources-only edits to a static manifest apply in place. The whole ladder — cold-booting a complete self-hosted control plane on an unprepared host — is validated end to end on a 1 vCPU / 2 GB VPS.
 
 **Operability**
 - Kubelet HTTP API: `exec` (incl. stdin), `attach`, `logs` (incl. `--previous`), `port-forward`.
 - Native `journald` logs and `machinectl` visibility — operators inspect pods with the same tooling they already use.
-- Zero-downtime daemon upgrades (`KillMode=process`): restarting/upgrading perigeos does not stop the pods; it rediscovers them and resumes reconciling.
-- The **`apsis`** CLI: `status`, `doctor`, `pods`, `top`, `cleanup`, `images` (list / `rm` / `verify`), `ingest` (load an image into the node library), `pawns scale` (dynamic scaling), `rollout`.
+- Zero-downtime daemon upgrades (`KillMode=process`): restarting/upgrading perigeos does not stop the pods; it rediscovers them and resumes reconciling. Measured under sustained ~1,500 req/s load: zero failed requests and zero container restarts across a daemon restart (see [benches/README.md](benches/README.md)).
+- Metrics beyond the kubelet's: PSI CPU/memory/IO stall pressure for the host and the daemon's own slice, and kernel netns/skb slab occupancy — the things that actually bite at high pod density.
+- The **`apsis`** CLI: `status`, `doctor`, `inspect`, `pods`, `pawns`, `machines`, `top`, `showcase`; `images` (list / `rm` / `verify` / `prune` / GC pins), `ingest`, `pull`; `sunset` / `dawn` / `freeze` / `thaw` / `budget` / `fuel`; `pawns add` / `resize` / `scale` / `remove`; `pods migrate` / `swap-plug`; `rollout`, `decommission`, `cleanup`, `stop`.
 
 ### Not supported / in progress
 
@@ -174,10 +236,11 @@ Periapsis can **coexist** with a standard kubelet or k3s node on the same cluste
 The commands below describe the private source tree's build and test flow; they aren't runnable from this repository, which contains no source. See [tests/README.md](tests/README.md) for the public test-surface summary.
 
 ```bash
-# Build the daemon (and the apsis CLI)
+# Build the daemon (and the apsis CLI, and the Trail WASM runtime)
 go build ./cmd/perigeos
-make build              # build-perigeos + build-apsis with version stamping
-make build-wasm-samples # build the sample WASIp2 components
+make build              # perigeos + apsis + trail, with version stamping
+make fetch-deps         # fetch the patched systemd-nspawn dependencies
+make build-wasm-samples # build the sample WASIp3 components
 
 # Test (unit tier: no root, no systemd, no cluster)
 go test ./...           # == make test / make test-unit
@@ -207,9 +270,9 @@ sudo apsis doctor
 
 ### Requirements
 
-- systemd v250+ (v260+ recommended) and cgroups v2
+- systemd v250+ (v260+ recommended) and cgroups v2. The pod user-namespace path additionally needs the nspawn fix from [systemd#41838](https://github.com/systemd/systemd/pull/41838) (merged upstream 2026-05-28); until that reaches your distro's systemd, Periapsis ships a patched `systemd-nspawn` build alongside the daemon.
 - Linux kernel 6.6+ for the multi-pawn eBPF CNI path; the single-pawn, host-network path runs on older kernels (verified on 6.1/arm64 — see [benches/README.md](benches/README.md))
-- Kubernetes 1.34+
+- Kubernetes 1.34+ (conformance is tracked against the version-matched 1.36 e2e suite)
 - Go 1.26+ to build
 - Optional: the Constellation CNI fork for cross-host networking and multi-pawn isolation; without it, pods use host-network veth bridges (single-pawn only)
 - Optional: kernel arg `swapaccount=1` for swap enforcement
@@ -222,20 +285,37 @@ sudo apsis doctor
 |------|------|
 | **Periapsis** | The project / repository (closest orbital approach) |
 | **Perigeos** | The daemon binary (Earth-specific periapsis) |
+| **Apogeos** | The Periapsis operator — the cluster-side half of perigeos's own concerns (node identity, CSR approval) |
+| **Apoapsis** | The self-hosted control-plane distribution: SQLite-backed apiserver + control-plane static pods (farthest orbital point) |
 | **Pawn** | A virtual Kubernetes node — wordplay on systemd-ns**pawn** |
 | **Scout** | The `PodLifecycleHandler` seam bridging the VK framework to the reconciler |
 | **Recon** | The sharded reconciler (Foci shards, Groundfall signal store, PodSM) |
 | **Clade** | The pure FSM + status kernel driving each container's state |
 | **Horizon** | The sole pod-status + event writer to the API server |
+| **Tidal** | Pod materialisation — the cluster's state flowing down into the pod: env, volumes, rotated tokens |
 | **Constellation** | The Cilium fork for multi-pawn networking |
-| **Trail** | The WASIp2 component runtime path |
+| **Trail** | The WASM host runtime and its capability-profile model |
+| **Meteorite** | The Trail operator — cluster-wide control plane for component composition and migration |
+| **meteor** | No relation beyond the sky: the tiny container entrypoint shim that sets a pod up and `execve()`s into the workload, leaving nothing of itself behind |
 | **Apsis** | The CLI for introspection and debugging |
+
+---
+
+## Upstream fixes
+
+Building a node agent on `systemd-nspawn` means hitting bugs in `systemd-nspawn`. Two were found this way and sent back upstream rather than worked around locally:
+
+- [**nspawn: fix EPERM when using `--private-users` with `--network-namespace-path`**](https://github.com/systemd/systemd/pull/41838) — **merged.** nspawn failed with `EPERM` when a container needed both a user namespace and to join an already-existing network namespace: the inner child entered the new userns first, after which the kernel refused the `setns()` into a foreign netns. For Periapsis this is not an edge case but literally every pod — UID-mapped *and* joined to the netns the CNI already set up.
+- [**nspawn: fix `.mstack` bind mounts being masked by `--volatile=overlay`**](https://github.com/systemd/systemd/pull/41897) — open, in review. Bind mounts silently disappeared under `--volatile=overlay`: overlayfs ignores active mount points inside the lowerdir, so the pod's mount stack — assembled from its image layers *before* the container starts — was masked by the overlay that went on top of it.
+
+(Status as of 2026-07-25.)
 
 ---
 
 ## Related projects
 
 - [virtual-kubelet](https://github.com/virtual-kubelet/virtual-kubelet) — the upstream fork base (Apache 2.0)
+- [Constellation](https://github.com/malformed-c/constellation) — the Cilium fork providing the multi-pawn eBPF datapath
 
 ---
 
