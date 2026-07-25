@@ -11,26 +11,104 @@ Periapsis is a fork of [virtual-kubelet](https://github.com/virtual-kubelet/virt
 This public repository is intentionally information-only. It contains public project material, test-surface summaries, and benchmark summaries. It does not contain source code, ADRs, or operational secrets (for now, expect a release in around 2 to 3 months).
 
 ```text
-[engi@engix99 ~]$ sudo apsis status
+[engi@engix99 ~]$ sudo apsis status | head -20
 Hostname:    engix99
-Pawns:       30
-Pods:        287
-RSS:         177 MiB
-Machines:    287
-Netns:       298
+Version:     4743a2b4
+Uptime:      17m8s
+Pawns:       7
+Pods:        14
+Kernel:      7.1.4-x64v3-xanmod1
+Arch:        linux/amd64
+Go:          go1.26.5-X:nodwarf5
+Memory:      18563 / 47996 MiB
+CPU cores:   28
+Load avg:    1.46 1.85 1.87
+PSI cpu:     0.3%
+PSI memory:  0.0%
+
+Machines:    16
+Disk dirs:   75
+Units:       16
+RSS:         103 MiB
+LXC veths:   8
+Netns:       7
 
 [engi@engix99 ~]$ kubectl get nodes
-NAME               STATUS   ROLES                   AGE   VERSION
-compute-00         Ready    pawn                    42d   perigeos://dev
-...
-compute-29         Ready    pawn                    42d   perigeos://dev
-engix99            Ready    control-plane,primary   44d   v1.35.2+k3s1
+NAME               STATUS   ROLES     AGE     VERSION
+compute-09         Ready    pawn      5d10h   perigeos://4743a2b4
+engifire           Ready    primary   20d     perigeos://4743a2b4
+engifire-pawn-01   Ready    pawn      20d     perigeos://4743a2b4
+engifire-scale-1   Ready    pawn      18d     perigeos://4743a2b4
+engipi             Ready    primary   14d     perigeos://2a0b9a5a
+engix99            Ready    primary   20d     perigeos://4743a2b4
+engix99-e2e-1      Ready    pawn      23h     perigeos://4743a2b4
+engix99-e2e-2      Ready    pawn      20d     perigeos://4743a2b4
+engix99-scale-1    Ready    pawn      18d     perigeos://4743a2b4
+engix99-trail-1    Ready    pawn      20d     perigeos://4743a2b4
+engix99-trail-2    Ready    pawn      20d     perigeos://4743a2b4
 
-[engi@engix99 ~]$ machinectl | head -2
-MACHINE                                        CLASS     SERVICE        OS     VERSION
-pod-01922ac2-…-nginx                           container systemd-nspawn alpine 3.21.3
-pod-021aa7a8-…-nginx                           container systemd-nspawn alpine 3.21.3
+[engi@engix99 ~]$ sudo machinectl | head -4
+MACHINE                                                         CLASS     SERVICE        OS     VERSION           ADDRESSES
+pod-0f0190c9-92d1-4da2-ac72-4818f091e03a-app                    container systemd-nspawn arch   20260712.0.555161 10.0.67.162…
+pod-2d5950fe-9d92-437a-804e-0460fecb1f00-kube-apiserver         container systemd-nspawn wolfi  20230201          -
+pod-585678a0-df26-4ee3-86a7-5cac27626773-kube-controll-4a994d4a container systemd-nspawn wolfi  20230201          -
 ```
+
+Eleven nodes, three physical hosts, two CPU architectures (`engipi` is a Raspberry Pi Zero 2 W — see [benches/README.md](benches/README.md)), and **no kubelet anywhere in the cluster**: every node reports a `perigeos://` version, and the control plane itself is running as `systemd-nspawn` machines. That is a live working fleet rather than a density run — for density, the 1,772-pod / 33-node benchmark is in [benches/README.md](benches/README.md).
+
+---
+
+## What a pawn is
+
+A **pawn** is a virtual Kubernetes node: a full, scheduler-visible `Node` object backed by a slice of a physical host rather than by a machine of its own. The name is wordplay on systemd-ns**pawn**.
+
+```text
+[engi@engix99 ~]$ sudo apsis status | grep -A8 '^Pawns:$'
+Pawns:
+NAME             ROLE     PORT   IP  PODS  CPU(ms)   MEM(MiB)
+compute-09       pawn     12261      0     26531     167
+engix99          primary  12260      7     15420353  2411
+engix99-e2e-1    pawn     12262      0     31305     64
+engix99-e2e-2    pawn     12263      0     31647     4
+engix99-scale-1  pawn     12264      0     30409     5
+engix99-trail-1  pawn     12265      4     241704    176
+engix99-trail-2  pawn     12266      3     84757     80
+```
+
+Each pawn owns the things a node is expected to own:
+
+- **Its own identity** — a distinct TLS client certificate and node name, so the API server authenticates it as a separate node and the usual node-restriction rules apply to it individually.
+- **Its own kubelet API endpoint** — its own port on the host, serving `exec`, `attach`, `logs`, `port-forward`, and metrics for its own pods. `kubectl exec` reaches a pod through the pawn that owns it, exactly as it would through a kubelet.
+- **Its own capacity** — CPU and memory allocatable carved from a host-wide budget, enforced as a cgroup slice rather than advertised as a number. The sum of pawns cannot oversubscribe the host, and a per-host budget cap leaves headroom for a co-located real kubelet. Pod capacity per pawn is configurable (the fleet above runs 256 per pawn against the stock kubelet's hard 110).
+- **Its own scheduling surface** — labels, taints, cordon/drain, pod CIDR, and per-pod network namespaces. Affinity, anti-affinity, topology spread, and `PodDisruptionBudget` all behave as they would across separate machines.
+
+Allocatable is per pawn and independently sized, so one host can present a large node and several small ones — and every one of them advertises a pod capacity well past the stock kubelet's hard 110:
+
+```text
+[engi@engix99 ~]$ kubectl get nodes -o custom-columns=NAME:.metadata.name,PODS:.status.capacity.pods,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory
+NAME               PODS   CPU   MEM
+compute-09         256    2     2G
+engifire           256    1     2G
+engifire-pawn-01   256    1     512M
+engifire-scale-1   256    1     1536Mi
+engipi             256    1     512M
+engix99            256    4     3Gi
+engix99-e2e-1      256    2     2G
+engix99-e2e-2      256    2     2G
+engix99-scale-1    256    2     2Gi
+engix99-trail-1    256    5     9Gi
+engix99-trail-2    256    2     2G
+```
+
+One host's first node takes the host's own name and the **`primary`** role; it carries the host-level duties, including any static pods and the self-hosted control plane. Additional nodes on that host register as ordinary **`pawn`** nodes. Above the node boundary nothing can tell them apart from hardware nodes except the honest `perigeos://` version string.
+
+Two structural points that are easy to get wrong:
+
+**One daemon, many nodes.** Pawns are not one process each — a single `perigeos` process serves every pawn on the host, which is why idle overhead grows so slowly with pawn count (see the RSS figures in [benches/README.md](benches/README.md)). Pawn count is a configuration choice rather than a property of the hardware, and it is changeable at runtime: `apsis pawns add`, `resize`, and `scale` reshape a live host's node topology without restarting the daemon, and `apsis pawns remove --drain` cordons and evicts a pawn's pods before retiring it. A shrink that would fall below what its pods have already been promised is refused rather than silently overcommitted.
+
+**A pawn is not an isolation or failure boundary.** It is not a VM, adds no kernel, and adds no hypervisor. Containment comes from the per-pod cgroup slice and namespaces, not from the pawn — two pods on different pawns of one host are isolated from each other exactly as much as two pods on the same pawn, and no more. Consequently **more pawns does not mean a bigger blast radius, and it does not buy high availability.** Every pawn on a host shares that host's kernel, hardware, and power supply. If the host goes down, every pawn and every pod on it goes down together, no matter how finely it was sliced. High availability still comes from spreading workloads across separate physical **hosts** with anti-affinity or topology spread, the same as it would with stock kubelet nodes.
+
+**Terminology:** a *host* is not the same thing as a Kubernetes *node*. One host presents many pawns, and each pawn is a node. Confusingly, `apsis status` and `machinectl` also use the word *machine* — there a "machine" is a running **pod**, not a host.
 
 ---
 
@@ -103,11 +181,7 @@ Periapsis fits trusted, density-first deployments where the CRI / microVM tax is
 - **Edge & small VPS** — the stock kubelet+containerd stack is heavy before any workload runs; a single-pawn Periapsis daemon idles in the 70–130 MB range and leaves the box for the workload (plus the WASM (WASIp3 components) `runtimeClass` path for tiny, sandboxed edge workloads).
 - **Homelab / bare-metal saturation** — fill a big Xeon/Threadripper box past the 110-pod cap without underutilising it or adding the KubeVirt/Kata microVM latency and memory tax. Co-exists with an existing k3s/kubelet node on the same host.
 
-It is the **wrong** tool for hostile multi-tenancy: pods share the host kernel, so untrusted code that can exploit a kernel bug is out of scope — reach for a microVM runtime there.
-
-**Terminology:** a *host* (or *machine*, in the `apsis status` / `machinectl` sense — there a "machine" is a running pod, not a host) is not the same thing as a Kubernetes *node* (a *pawn*, in Periapsis terms). One physical host can present many pawns: one daemon process, many scheduler-visible nodes.
-
-**More pawns does not mean a bigger blast radius, and it does not buy high availability.** Every pawn on a host shares that host's kernel, hardware, and power supply — pawns are not independent failure domains. Slicing one host into more pawns changes density and scheduler-visible node count; it does not add or remove an isolation boundary, and it does not make the host itself redundant. If the host goes down, every pawn and every pod on it goes down together, regardless of how many pawns it was sliced into. High availability still comes from spreading workloads across separate physical **hosts** (with anti-affinity / topology spread), the same as it would with stock kubelet nodes.
+It is the **wrong** tool for hostile multi-tenancy: pods share the host kernel, so untrusted code that can exploit a kernel bug is out of scope — reach for a microVM runtime there. It is also the wrong tool for high availability on its own: see [what a pawn is](#what-a-pawn-is) for why slicing one host into more pawns buys density, not redundancy.
 
 ---
 
