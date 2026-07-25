@@ -231,7 +231,14 @@ root:2000 drwxrwsr-x                       # fsGroup owns the volume, setgid bit
 - Per-pawn slice caps and a per-host budget cap, leaving headroom for a co-located real kubelet. **Dynamic pawn scaling** from the budget: `apsis pawns scale <set> <count>` reconciles a pawn set to a target count, sizing each pawn to an even share of the host budget; `apsis pawns add` / `resize` / `remove --drain` change a live host's node topology without a restart.
 - Opt-in **KSM memory dedup** per pod (`periapsis.io/memory-ksm`) — many near-identical pods on one host share identical pages.
 
-**Idle & wake (scale-to-zero)** — a pod annotated for scale-to-zero idles after an inactivity window: the app container is stopped and its memory reclaimed, while the netns, pod IP, and overlay rootfs are retained, so the pod stays routable and its restart is a warm start rather than a fresh schedule. An incoming connection wakes it through an eBPF trap on the pod IP; the pod is reported in an `Idled` phase meanwhile. Measured wake latency is **~1.4–1.6 s**, consistently (see [benches/README.md](benches/README.md)).
+**Idle & wake (scale-to-zero)** — a pod opts in with `periapsis.io/scale-to-zero`, and collapses after an inactivity window. There are two tiers, and the pod object survives both:
+
+- **Frozen** (`periapsis.io/freeze-after`) — the same process, the same memory, simply taken off the CPU via the cgroup-v2 freezer. A warmed-up JIT, connection pools, caches, loaded model weights all stay warm; thawing clears the freeze flag and the process continues at the instruction it stopped on. Honestly stated: this saves CPU and wake time, **not** RAM.
+- **Idled** (`periapsis.io/idle-after`, default 5m) — the process really stops and its memory is reclaimed, but the pod is not deleted: it stays in the API server, its network namespace, IP, and rootfs are retained, and the image is still on the node. Waking starts a fresh process inside the environment that is already there. Idle apps cost disk, not RAM.
+
+An idled pod reports a truthful `Ready=False, reason=Idled` rather than pretending to be pending or crashed. The wake itself measures **~1.4–1.6 s**, consistently (see [benches/README.md](benches/README.md) — timed around an explicit wake command, so it is the wake operation rather than an end-to-end request).
+
+Traffic triggers it automatically: the eBPF datapath sees a SYN for an idled pod's IP and fires the wake. One honesty note on that path — eBPF cannot complete a handshake to a backend that does not exist yet, so it drops the SYN and lets the client's own TCP stack retransmit. The connection then succeeds, and from the client's side it looks like a slow connect rather than an error, but the observable floor is quantized to the client's retransmit schedule (≥1 s) on top of the wake itself: a pod that is genuinely ready in 200 ms is still only reachable at the next retry. In exchange it covers any TCP protocol rather than HTTP only, and puts nothing in the hot path of a warm request. An HTTP-aware wake hook at the edge, which would hold the request and remove the quantization, is designed but not yet built.
 
 ```text
 $ kubectl get pods -n nginx-demo
@@ -240,7 +247,19 @@ nginx-whoami-758f9d579-nd2gw   0/1     Idled     0             5d10h   # RAM fre
 nginx-whoami-758f9d579-x69vp   1/1     Running   1 (13h ago)   5d10h
 ```
 
-Alongside the automatic path, an operator can drive it directly: `apsis sunset` / `dawn` (stop and warm-start), `apsis freeze` / `thaw` (cgroup-v2 freezer — the *same* process suspended and resumed, not a cold start), and wall-time / CPU-time budgets (`apsis budget`, `apsis fuel`) that force a pod idle once it has consumed its allowance.
+Alongside the automatic path, an operator can drive it directly: `apsis sunset` / `dawn` (idle and wake), `apsis freeze` / `thaw` (the freezer tier), and wall-time / CPU-time budgets (`apsis budget`, `apsis fuel`) that force a pod idle once it has consumed its allowance.
+
+### vs Knative
+
+The shared premise is the same: a pod nobody is talking to should collapse. The mechanism is not.
+
+Knative Serving takes the Revision's Deployment to zero replicas, and the ReplicaSet deletes the pod outright. The next request therefore builds a **new** pod — new UID, new IP, a trip through the scheduler, CNI IPAM from scratch. In Knative's model, "collapsing" a pod *is* deleting it.
+
+In Periapsis the pod object never goes away. A frozen pod is the same process taken off the CPU; an idled pod is the same pod with its process stopped — same UID, same IP, same network namespace, image already local, scheduler not involved. That is what the ~1.4–1.6 s figure describes, over 9 clean cycles.
+
+**No Knative number is quoted next to it, deliberately.** There is no reproducible measurement of Knative taken on this hardware, and published cold-start benchmarks depend far too much on configuration to make an honest side-by-side. The two are structurally different operations regardless: one resumes an existing pod, the other assembles a new one.
+
+They also aren't substitutes. Knative is a portable serving layer *above* the node — revisions, traffic splitting, request-driven replica autoscaling, an activator that buffers requests, eventing — and it runs on any conformant cluster. Periapsis's version is a node-level primitive on ordinary pods: no new API objects, no per-pod sidecar, no ingress dependency, but equally no revision model and no replica autoscaling, and it needs Periapsis nodes. Nothing structural stops Knative from running on top of Periapsis nodes, since everything above the node boundary is ordinary Kubernetes — though that combination hasn't been validated here.
 
 **WASM (Trail) workloads** — a pod with `runtimeClassName: trail` runs a WASIp3 **component** via the **host-runtime path**: a transient unit joined to the pod netns, `wasi:sockets` bound on the pod IP (a WASM runtimeClass with no installed runtime fails closed). Bare wasip1 CLI runtimes (running a raw core module with no component model, no host-capability profile, no checkpoint/restore) are deliberately not supported in favor of Trail's component path; `trail` is the only WASM runtimeClass today (earlier separate `wasmtime`/`wasmedge`/`wasmer` classes have been consolidated into it).
 

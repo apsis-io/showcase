@@ -36,7 +36,7 @@ The small-fleet latency figure is a fresh data point, not a direct comparison to
 
 ## Scale-To-Zero Wake Latency (2026-07-06)
 
-An idled ("sunset") pod keeps its network namespace, address, and overlay rootfs while its memory is reclaimed, so waking it is a warm start rather than a fresh schedule. Measured over 9 clean idle/wake cycles on one pawn, timed both externally around the wake call and by the daemon's own self-reported wake time (the two agreed within ~30 ms every cycle):
+An idled ("sunset") pod keeps its network namespace, address, and overlay rootfs while its memory is reclaimed, so waking it is a warm start rather than a fresh schedule. Measured over 9 clean idle/wake cycles on one pawn, driven by an explicit wake command and timed both externally around that call and by the daemon's own self-reported wake time (the two agreed within ~30 ms every cycle):
 
 | Metric | Result |
 | --- | --- |
@@ -44,7 +44,9 @@ An idled ("sunset") pod keeps its network namespace, address, and overlay rootfs
 | Idle → confirmed stopped | 5.15–5.34 s, bounded by the fixture's 5 s termination grace period |
 | Cold start for comparison (delete → replacement pod Ready) | bimodal, ~2.0 s or ~5.3–5.7 s, 5 samples |
 
-Honest caveats: small sample sizes — enough for an order of magnitude and to confirm consistency, not a rigorous distribution. All samples are same-node; no cross-node numbers were taken. The cold-start bimodality was not root-caused; the plausible-but-unverified guess is network-resource reuse waiting on the old pod's full teardown. The idle-to-stopped figure is dominated by the test workload ignoring `SIGTERM`, not by Periapsis.
+Honest caveats: small sample sizes — enough for an order of magnitude and to confirm consistency, not a rigorous distribution. All samples are same-node; no cross-node numbers were taken. The cold-start bimodality was not root-caused; the plausible-but-unverified guess is network-resource reuse waiting on the old pod's full teardown. The idle-to-stopped figure is dominated by the test workload ignoring `SIGTERM`, not by Periapsis. And this is the **wake operation**, not an end-to-end client experience: a wake triggered by real traffic through the eBPF path adds the client's TCP retransmit boundary (≥1 s) on top, because the SYN that triggers the wake is dropped rather than held.
+
+The freezer tier (process suspended in place rather than stopped) was not separately benchmarked — structurally there is little to measure there beyond a write to `cgroupfs` and a reconciler pass — and no comparison figure was taken against any other scale-to-zero implementation; see the `vs Knative` note in the main README for why none is quoted.
 
 ## Daemon Restart Under Load (2026-07-08)
 
