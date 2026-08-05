@@ -8,7 +8,7 @@ Kubernetes has exactly one kubelet. Periapsis is a **second implementation of th
 
 Periapsis is a fork of [virtual-kubelet](https://github.com/virtual-kubelet/virtual-kubelet) that absorbs the full **perigeos** stack: a Kubernetes node agent that bypasses the CRI and containerd entirely and runs pods directly on a Linux host as `systemd-nspawn` machines (with host-process and host-runtime WASM launch modes alongside). A single physical host registers as many independent virtual nodes — called **pawns** — each with its own TLS identity, kubelet API endpoint, pod CIDR, and cgroup slice, and each shaped independently (a compute pawn, an I/O-capped storage pawn, a memory-heavy pawn, on one box). The scheduler treats them as separate nodes; the workloads stay native units on the host.
 
-This public repository is intentionally information-only. It contains public project material, test-surface summaries, and benchmark summaries. It does not contain source code, ADRs, or operational secrets (for now, expect a release in around 2 to 3 months).
+This public repository is intentionally information-only. It contains public project material, test-surface summaries, and benchmark summaries. It does not contain source code, ADRs, or operational secrets (for now, expect a release in around 2 to 3 months). The long-form write-up — motivation, architecture, and the numbers with their methodology — is on Habr (Russian): [«Памятник kubelet, или Kubernetes != CRI»](https://habr.com/ru/articles/1058526/).
 
 ```text
 [engi@engix99 ~]$ sudo apsis status | head -20
@@ -226,15 +226,15 @@ root:2000 drwxrwsr-x                       # fsGroup owns the volume, setgid bit
 **Resources & containment**
 - `resources.limits` become real cgroup-v2 caps (`memory.max` / `cpu.max` / `pids.max`), not scheduler hints — an over-limit container is contained, not the host.
 - **In-place pod resize (KEP-1287)**: a running container's CPU/memory limit is moved on its live cgroup without a restart (`resizePolicy: NotRequired`), or with a deliberate restart where the policy asks for one — for app containers, native sidecars, and running init containers alike, with a `ResizeCompleted` event and enacted values in the pod status. **Pod-level resources** (the pod-scoped `spec.resources`) and pod-level resize are supported too, and the node advertises the matching feature so the scheduler can rely on it.
-- Per-pod PID cap / fork-bomb containment (`periapsis.io/max-pids`).
+- Per-pod PID cap / fork-bomb containment (`peri.apsis/max-pids`).
 - Node-pressure eviction ranked kubelet-style (QoS → priority → usage); disk-pressure image/layer GC before pod eviction.
 - Per-pawn slice caps and a per-host budget cap, leaving headroom for a co-located real kubelet. **Dynamic pawn scaling** from the budget: `apsis pawns scale <set> <count>` reconciles a pawn set to a target count, sizing each pawn to an even share of the host budget; `apsis pawns add` / `resize` / `remove --drain` change a live host's node topology without a restart.
-- Opt-in **KSM memory dedup** per pod (`periapsis.io/memory-ksm`) — many near-identical pods on one host share identical pages.
+- Opt-in **KSM memory dedup** per pod (`peri.apsis/memory-ksm`) — many near-identical pods on one host share identical pages.
 
-**Idle & wake (scale-to-zero)** — a pod opts in with `periapsis.io/scale-to-zero`, and collapses after an inactivity window. There are two tiers, and the pod object survives both:
+**Idle & wake (scale-to-zero)** — a pod opts in with `peri.apsis/scale-to-zero`, and collapses after an inactivity window. There are two tiers, and the pod object survives both:
 
-- **Frozen** (`periapsis.io/freeze-after`) — the same process, the same memory, simply taken off the CPU via the cgroup-v2 freezer. A warmed-up JIT, connection pools, caches, loaded model weights all stay warm; thawing clears the freeze flag and the process continues at the instruction it stopped on. Honestly stated: this saves CPU and wake time, **not** RAM.
-- **Idled** (`periapsis.io/idle-after`, default 5m) — the process really stops and its memory is reclaimed, but the pod is not deleted: it stays in the API server, its network namespace, IP, and rootfs are retained, and the image is still on the node. Waking starts a fresh process inside the environment that is already there. Idle apps cost disk, not RAM.
+- **Frozen** (`peri.apsis/freeze-after`) — the same process, the same memory, simply taken off the CPU via the cgroup-v2 freezer. A warmed-up JIT, connection pools, caches, loaded model weights all stay warm; thawing clears the freeze flag and the process continues at the instruction it stopped on. Honestly stated: this saves CPU and wake time, **not** RAM.
+- **Idled** (`peri.apsis/idle-after`, default 5m) — the process really stops and its memory is reclaimed, but the pod is not deleted: it stays in the API server, its network namespace, IP, and rootfs are retained, and the image is still on the node. Waking starts a fresh process inside the environment that is already there. Idle apps cost disk, not RAM.
 
 An idled pod reports a truthful `Ready=False, reason=Idled` rather than pretending to be pending or crashed. The wake itself measures **~1.4–1.6 s**, consistently (see [benches/README.md](benches/README.md) — timed around an explicit wake command, so it is the wake operation rather than an end-to-end request).
 
@@ -460,7 +460,7 @@ sudo apsis doctor
 | **Tidal** | Pod materialisation — the cluster's state flowing down into the pod: env, volumes, rotated tokens |
 | **Constellation** | The Cilium fork for multi-pawn networking |
 | **Trail** | The WASM host runtime and its capability-profile model |
-| **Meteorite** | The Trail operator — cluster-wide control plane for component composition and migration |
+| **Radiant** | The Trail operator — cluster-wide control plane for component composition and migration (the radiant is the point in the sky a meteor shower streams from) |
 | **meteor** | No relation beyond the sky: the tiny container entrypoint shim that sets a pod up and `execve()`s into the workload, leaving nothing of itself behind |
 | **Apsis** | The CLI for introspection and debugging |
 
@@ -473,7 +473,7 @@ Building a node agent on `systemd-nspawn` means hitting bugs in `systemd-nspawn`
 - [**nspawn: fix EPERM when using `--private-users` with `--network-namespace-path`**](https://github.com/systemd/systemd/pull/41838) — **merged.** nspawn failed with `EPERM` when a container needed both a user namespace and to join an already-existing network namespace: the inner child entered the new userns first, after which the kernel refused the `setns()` into a foreign netns. For Periapsis this is not an edge case but literally every pod — UID-mapped *and* joined to the netns the CNI already set up.
 - [**nspawn: fix `.mstack` bind mounts being masked by `--volatile=overlay`**](https://github.com/systemd/systemd/pull/41897) — open, in review. Bind mounts silently disappeared under `--volatile=overlay`: overlayfs ignores active mount points inside the lowerdir, so the pod's mount stack — assembled from its image layers *before* the container starts — was masked by the overlay that went on top of it.
 
-(Status as of 2026-07-25.)
+(Status as of 2026-08-05.)
 
 ---
 
