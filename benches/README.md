@@ -46,19 +46,21 @@ Every figure above is an absolute measurement of Periapsis with no comparison ba
 `deploy` is the overall deployment time, from `kubectl scale` to every replica Ready. `p50` is per-pod creation → Ready. `mem` is the host free-memory delta across the rollout.
 
 ```text
-                    |  deploy |   p50 |   max |     mem |  /pod |  procs | helper procs
---------------------+---------+-------+-------+---------+-------+--------+-------------------
- Periapsis @100  r1 |     26s |   15s |   22s |  563 MB | 5.6MB |   +201 | 103 nspawn
- Periapsis @100  r2 |     26s |   15s |   20s |  549 MB | 5.5MB |   +201 | 103 nspawn
- kubelet   @100  r2 |     36s |   26s |   28s | 1048 MB |10.5MB |   +302 | 104 shim+104 pause
---------------------+---------+-------+-------+---------+-------+--------+-------------------
- Periapsis @200  r1 |     37s |   24s |   30s | 1302 MB | 6.5MB |   +399 | 203 nspawn
- Periapsis @200  r2 |     42s |   24s |   31s | 1172 MB | 5.9MB |   +400 | 203 nspawn
- kubelet   @200  r1 |     57s |   40s |   51s | 2406 MB |12.0MB |   +597 | 204 shim+204 pause
- kubelet   @200  r2 |     57s |   43s |   51s | 2145 MB |10.7MB |   +600 | 204 shim+204 pause
---------------------+---------+-------+-------+---------+-------+--------+-------------------
-   kubelet costs    |   1.44x | 1.73x | 1.67x |   1.84x | 1.84x |  1.50x | 2.01x      (@200)
+                    |  deploy |   p50 |   max |     mem |  /pod |  procs | helper procs       | agent RSS
+--------------------+---------+-------+-------+---------+-------+--------+--------------------+----------
+ Periapsis @100  r1 |     26s |   15s |   22s |  563 MB | 5.6MB |   +201 | 103 nspawn         |   115 MB
+ Periapsis @100  r2 |     26s |   15s |   20s |  549 MB | 5.5MB |   +201 | 103 nspawn         |   120 MB
+ kubelet   @100  r2 |     36s |   26s |   28s | 1048 MB |10.5MB |   +302 | 104 shim+104 pause |   288 MB
+--------------------+---------+-------+-------+---------+-------+--------+--------------------+----------
+ Periapsis @200  r1 |     37s |   24s |   30s | 1302 MB | 6.5MB |   +399 | 203 nspawn         |   158 MB
+ Periapsis @200  r2 |     42s |   24s |   31s | 1172 MB | 5.9MB |   +400 | 203 nspawn         |   150 MB
+ kubelet   @200  r1 |     57s |   40s |   51s | 2406 MB |12.0MB |   +597 | 204 shim+204 pause |   402 MB
+ kubelet   @200  r2 |     57s |   43s |   51s | 2145 MB |10.7MB |   +600 | 204 shim+204 pause |   392 MB
+--------------------+---------+-------+-------+---------+-------+--------+--------------------+----------
+   kubelet costs    |   1.44x | 1.73x | 1.67x |   1.84x | 1.84x |  1.50x | 2.01x              |   2.58x
 ```
+
+`agent RSS` is the node agent's own resident memory with the pods running, at the end of the rollout — the process cost of running the node, separate from the pods themselves. For Periapsis that is one process. For kubelet it is **kubelet plus containerd summed**, since both are required to run a pod; at 200 pods that is 169 MB of kubelet and 233 MB of containerd. The k0s supervisor process (~95–100 MB) is *excluded* from kubelet's figure — it belongs to that distribution rather than to a stock kubelet + containerd node, and including it would flatter the comparison.
 
 ### Scheduled → Running
 
