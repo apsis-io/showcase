@@ -124,6 +124,10 @@ Two honest limits on that. The shaping is cgroup enforcement, not hardware parti
 
 **A pawn is not an isolation or failure boundary.** It is not a VM, adds no kernel, and adds no hypervisor. Containment comes from the per-pod cgroup slice and namespaces, not from the pawn — two pods on different pawns of one host are isolated from each other exactly as much as two pods on the same pawn, and no more. Consequently **more pawns does not mean a bigger blast radius, and it does not buy high availability.** Every pawn on a host shares that host's kernel, hardware, and power supply. If the host goes down, every pawn and every pod on it goes down together, no matter how finely it was sliced. High availability still comes from spreading workloads across separate physical **hosts** with anti-affinity or topology spread, the same as it would with stock kubelet nodes.
 
+**Pawns on one host can be homed to different clusters.** A pawn's cluster is a configuration property, so a single `perigeos` process can serve pawns registered to *separate control planes* — separate API servers, separate CAs, separate TLS identities per pawn — with no shared credential between them and no awareness of each other. Live-demonstrated against two control planes on one host. A pawn's cluster is immutable once set: rehoming means retiring the pawn and creating a new one, rather than silently moving a node between clusters underneath its pods.
+
+That is the project's answer to multi-tenancy, and it is deliberately a blunt one: **multi-tenant, multi-cluster and multi-homed are treated as a single concept.** Rather than partitioning one cluster with namespaces and policy, a tenant gets its own cluster and shares only the hardware. What the tenant sees is an ordinary Kubernetes cluster with ordinary nodes; what the operator sees is one process and one set of cgroup slices. The caveat from just above still applies unchanged — a pawn is not a security boundary, and two tenants homed to different control planes still share a kernel.
+
 **Terminology:** a *host* is not the same thing as a Kubernetes *node*. One host presents many pawns, and each pawn is a node. Confusingly, `apsis status` and `machinectl` also use the word *machine* — there a "machine" is a running **pod**, not a host.
 
 ---
@@ -350,7 +354,7 @@ Capsule is a **tenancy** layer: it groups namespaces into Tenants and constrains
 
 A pawn is not a tenancy concept at all. It is a node: its own cgroup slice, its own TLS identity, its own pod CIDR, its own scheduler entry. Where Capsule tells a tenant what it may request, a pawn is a boundary the kernel enforces whether anyone requested anything or not.
 
-That makes them complementary rather than competing, and the combination is the interesting one: give a tenant its own pawns via labels and taints, and its ceiling stops being a quota the control plane accounts for and becomes a cgroup the host enforces. Capsule keeps doing the part Periapsis has no opinion about — Periapsis has no tenancy model, no tenant owners, no self-service namespaces, and no plans for any.
+That makes them complementary rather than competing, and the combination is the interesting one: give a tenant its own pawns via labels and taints, and its ceiling stops being a quota the control plane accounts for and becomes a cgroup the host enforces. Taken further, the pawns need not even be in the same cluster — see [multihoming](#what-a-pawn-is), where a tenant gets its own control plane and shares only the hardware. Capsule keeps doing the part Periapsis has no opinion about — Periapsis has no tenancy model, no tenant owners, no self-service namespaces, and no plans for any.
 
 **One thing worth stating plainly, because "isolation" invites the wrong reading:** a pawn is not a security boundary against a hostile tenant, any more than a container is. It is namespaces and cgroups on a shared kernel. It buys resource containment and blast radius, not protection from a tenant attacking the kernel — for that, see [vs KubeVirt](#vs-kubevirt). Neither Capsule nor pawns change that; Capsule governs what tenants may do, pawns bound what they can consume.
 
@@ -378,13 +382,13 @@ One Periapsis host registers as 30+ independent pawns. That is an actual multi-n
 
 ### vs Multus
 
-These get compared because both put more than one network identity on a single host, but they are orthogonal and neither substitutes for the other.
+The word **multihoming** means different things on each side, which is the whole comparison.
 
-Multus is a meta-CNI: it attaches **multiple interfaces to one pod**, so a workload can sit on a management network and a dataplane network at once, or reach an SR-IOV device directly. The pod stays on one node.
+Multus is a meta-CNI: it attaches **several interfaces to one pod**, so a workload can sit on a management network and a dataplane network at once, or reach an SR-IOV device directly. The pod stays on one node, in one cluster.
 
-Pawns go the other way. Each pawn is a separate **node** with its own pod CIDR, its own network namespace per pod, its own kubelet endpoint and TLS identity — and a pod on it still gets exactly one interface, as it would anywhere else. Pawns are a node-identity feature that happens to include networking, not a networking feature.
+Periapsis multihomes the **host**, not the pod: pawns on a single machine can be registered to different clusters entirely, as described in [What a pawn is](#what-a-pawn-is). A pod on a pawn gets one interface, as it would anywhere else — what is multiplied is node identity and cluster membership, not NICs.
 
-So they answer different questions, and they should compose: Multus is invoked through the standard CNI path, which a Periapsis node with standard CNI configuration uses unchanged. **That combination has not been validated here**, and it is worth saying rather than implying — the multi-pawn case runs on [Constellation](https://github.com/malformed-c/constellation), and what a meta-CNI does across pawn boundaries has not been tested.
+So they are orthogonal rather than competing, and they should compose: Multus is invoked through the standard CNI path, which a Periapsis node with standard CNI configuration uses unchanged. **That combination has not been validated here**, and it is worth saying rather than implying — the multi-pawn case runs on [Constellation](https://github.com/malformed-c/constellation), and what a meta-CNI does across pawn boundaries has not been tested.
 
 ### vs Knative
 
