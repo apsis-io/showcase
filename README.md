@@ -1,4 +1,4 @@
-# Periapsis
+# [ :: ] Periapsis
 
 ### From the Seas to the Stars — Kubernetes' Pawn
 
@@ -6,7 +6,7 @@
 
 Kubernetes has exactly one kubelet. Periapsis is a **second implementation of the Kubernetes node** — it preserves kubelet *semantics* while replacing the CRI execution model with systemd, on the claim that the node is an interface, not a component. It never masquerades as kubelet: events say `perigeos`, the node version says `perigeos://`, and the cluster sees an honest node, not a costume.
 
-Periapsis is a fork of [virtual-kubelet](https://github.com/virtual-kubelet/virtual-kubelet) that absorbs the full **perigeos** stack: a Kubernetes node agent that bypasses the CRI and containerd entirely and runs pods directly on a Linux host as `systemd-nspawn` machines (with host-process and host-runtime WASM launch modes alongside). A single physical host registers as many independent virtual nodes — called **pawns** — each with its own TLS identity, kubelet API endpoint, pod CIDR, and cgroup slice, and each shaped independently (a compute pawn, an I/O-capped storage pawn, a memory-heavy pawn, on one box). The scheduler treats them as separate nodes; the workloads stay native units on the host.
+Periapsis is a Kubernetes node agent that bypasses the CRI and containerd entirely and runs pods directly on a Linux host as `systemd-nspawn` machines (with host-process and host-runtime WASM launch modes alongside). A single physical host registers as many independent virtual nodes — called **pawns** — each with its own TLS identity, kubelet API endpoint, pod CIDR, and cgroup slice, and each shaped independently (a compute pawn, an I/O-capped storage pawn, a memory-heavy pawn, on one box). The scheduler treats them as separate nodes; the workloads stay native units on the host.
 
 This public repository is intentionally information-only. It contains public project material, test-surface summaries, and benchmark summaries. It does not contain source code, ADRs, or operational secrets (for now, expect a release in around 2 to 3 months). The long-form write-up — motivation, architecture, and the numbers with their methodology — is on Habr (Russian): [«Памятник kubelet, или Kubernetes != CRI»](https://habr.com/ru/articles/1058526/).
 
@@ -184,7 +184,7 @@ Periapsis removes the entire CRI stack. A pod is a `systemd-nspawn` transient un
 | Visibility | `crictl` / `ctr` | transparent (`machinectl`) |
 | Daemon upgrades | disruptive (drain node) | zero-downtime (`KillMode=process`) |
 
-See [benches/README.md](benches/README.md) for the public benchmark notes, including the 1,772-pod density/throughput result.
+See [benches/README.md](benches/README.md) for the public benchmark notes, including the 1,772-pod density/throughput result and a direct head-to-head against stock kubelet on identical hardware (2026-08-11): ~1.4x faster to deploy 200 pods, ~2.2x faster from Scheduled to Running, and ~1.8x less host memory — with the caveats, including the ones that cut the other way, stated there.
 
 ---
 

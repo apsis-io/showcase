@@ -17,6 +17,7 @@ Periapsis benchmarks focus on density and host overhead rather than synthetic mi
 - Idle-to-wake latency for scale-to-zero pods.
 - Traffic continuity across a daemon restart under load.
 - Time from a local artifact to a pod serving real traffic.
+- Direct head-to-head against stock kubelet on identical hardware under one protocol.
 
 ## Representative Results
 
@@ -33,6 +34,90 @@ The following numbers are public snapshot figures from development and validatio
 | Small-fleet HTTP latency (2026-07-06, 7 nodes / 21 pods, 2,910 req/s) | p95 1.36 ms, p99 sub-millisecond, 0% errors |
 
 The small-fleet latency figure is a fresh data point, not a direct comparison to the WASIX-era throughput sample above — different fleet size, workload, request rate, and (by now) a different runtime class entirely. It shouldn't be read as an improvement claim over any prior measurement.
+
+## Head-To-Head Against Stock kubelet (2026-08-11)
+
+Every figure above is an absolute measurement of Periapsis with no comparison baseline. This is the first direct head-to-head, and it was run because absolute numbers cannot be falsified: any per-pod overhead figure can be called good until something else is measured the same way.
+
+**Setup.** One physical board — Raspberry Pi CM5, arm64, 4 cores, 8 GiB, kernel 6.18.34 — running first stock kubelet and then Periapsis, with the board torn back to bare metal and rebooted between arms. The Kubernetes control plane (k0s v1.36.3) ran on a *separate* board throughout, so neither arm is co-located with the API server. kubelet was a k0s worker with `--max-pods=250` (its default of 110 cannot hold 200 pods). The workload was the same Deployment object in both arms — `traefik/whoami`, requests 8Mi/10m, limits 32Mi/100m — with only the `nodeSelector` and the node's runtime changed.
+
+**Protocol.** Per cell: scale to 0, wait until the board's 1-minute load average falls below 2, capture host metrics, roll out N pods, capture again. Two runs per scale per runtime. All runs warm — each install got a discarded warm-up rollout first, so no figure includes an image pull. Load is recorded next to every result rather than assumed, because an earlier attempt at this comparison produced a 2x result in the wrong direction purely from starting one run on an already-loaded board.
+
+`deploy` is the overall deployment time, from `kubectl scale` to every replica Ready. `p50` is per-pod creation → Ready. `mem` is the host free-memory delta across the rollout.
+
+```text
+                    |  deploy |   p50 |   max |     mem |  /pod |  procs | helper procs
+--------------------+---------+-------+-------+---------+-------+--------+-------------------
+ Periapsis @100  r1 |     26s |   15s |   22s |  563 MB | 5.6MB |   +201 | 103 nspawn
+ Periapsis @100  r2 |     26s |   15s |   20s |  549 MB | 5.5MB |   +201 | 103 nspawn
+ kubelet   @100  r2 |     36s |   26s |   28s | 1048 MB |10.5MB |   +302 | 104 shim+104 pause
+--------------------+---------+-------+-------+---------+-------+--------+-------------------
+ Periapsis @200  r1 |     37s |   24s |   30s | 1302 MB | 6.5MB |   +399 | 203 nspawn
+ Periapsis @200  r2 |     42s |   24s |   31s | 1172 MB | 5.9MB |   +400 | 203 nspawn
+ kubelet   @200  r1 |     57s |   40s |   51s | 2406 MB |12.0MB |   +597 | 204 shim+204 pause
+ kubelet   @200  r2 |     57s |   43s |   51s | 2145 MB |10.7MB |   +600 | 204 shim+204 pause
+--------------------+---------+-------+-------+---------+-------+--------+-------------------
+   kubelet costs    |   1.44x | 1.73x | 1.67x |   1.84x | 1.84x |  1.50x | 2.01x      (@200)
+```
+
+### Scheduled → Running
+
+Creation → Ready includes the workload's own readiness probe, which is Deployment configuration rather than anything the runtime does. Scheduled → Running excludes it and isolates the runtime's work: from the pod being bound to a node, to its container process running. At 200 pods:
+
+```text
+ band          Periapsis     kubelet
+ <= 10s            17            0
+ 10 - 20s         150            6
+ 20 - 30s          33           34
+ 30 - 45s           0          160
+               ----------    ----------
+ mean            15.6s        ~33.6s
+ p50             14.0s      in 30-45s
+```
+
+Roughly 2.2x on the mean, with distributions that barely overlap. On the Periapsis side, Scheduled → Ready was 25.2s mean, so about 12 seconds of the wait to Ready is the readiness probe rather than the runtime.
+
+### Where kubelet's extra memory goes
+
+Measured directly rather than inferred. Both runtimes run helper processes per workload; the difference is what they cost.
+
+```text
+ containerd-shim   206 procs   ~5.1 MB PSS each   = 1044 MB
+ /pause            204 procs     33 KB PSS each   =    6 MB
+ systemd-nspawn    203 procs     48 KB      each  =   10 MB
+```
+
+The shims alone account for roughly 46% of kubelet's entire memory delta at 200 pods — about 5.2 MB per pod of pure runtime tax, against 48 KB for an nspawn supervisor. The pause containers are *not* the cost; at 6 MB total they are noise. PSS is used rather than summed RSS deliberately: summing RSS across 106 shims overstated the figure by 2.2x (1322 MB against 600 MB) because every process counts the shared binary text.
+
+### Container state discovery: events against polling
+
+kubelet learns that a container changed state by asking the runtime, on a timer. Its own metrics across these runs:
+
+```text
+ kubelet_pleg_relist_interval_seconds           1033 ms mean, over 1006 intervals
+ kubelet_pleg_relist_duration_seconds           32.3 ms mean
+ kubelet_evented_pleg_connection_success_count  0
+```
+
+The last line is the important one. Evented PLEG (KEP-3386), which replaces that polling loop with a CRI event stream, is compiled into this kubelet and its metrics are registered — but it never established a connection. It has been alpha since 1.26 and is still not on by default in 1.36. So on a stock node every container transition is discovered on the next relist, on average half a second and at most about a second after it happens, once per pod per transition.
+
+Periapsis has no relist loop. Workload state changes arrive as events when they happen, so nothing waits for a poll to come round.
+
+That is a structural contributor to the Scheduled → Running gap rather than a tuning difference, and it is the part of the result least likely to change: it does not depend on the workload, the hardware, or how well either side is tuned. It also does not require kubelet to be doing anything wrong — polling is what CRI's interface makes cheap, and the event stream that would fix it is exactly the piece still in development.
+
+### Caveats
+
+These matter more than the numbers, and several of them cut against Periapsis.
+
+**This is the friendliest possible workload.** A tiny single-container stateless HTTP server: no volumes, no init containers, no mounted secrets or configMaps. One hardware profile (4-core arm64), two scale points. Nothing here says what happens to a multi-container pod with volumes on an x86 host, which is where the margin would be expected to shrink first.
+
+**The helper-process advantage is specific to single-container pods.** A shim and a pause are per *pod*; an nspawn supervisor is per *container*. A three-container pod would give kubelet 2 helper processes and Periapsis 3. The memory conclusion survives it — three supervisors are 144 KB against one shim's 5.1 MB — but the process-count ratio does not generalise.
+
+**The Scheduled → Running comparison is sourced differently on each side, and the asymmetry favours kubelet.** kubelet's figure is its own `kubelet_pod_start_duration_seconds`, defined as "from kubelet seeing a pod for the first time to the pod starting to run". The Periapsis figure is taken from the Kubernetes API objects instead — `PodScheduled` to the container's `running.startedAt` — so the delay between the scheduler binding a pod and the node hearing about it is *excluded* from kubelet's number and *included* in ours. kubelet's p50 is given as a band rather than a number because its histogram buckets step 10 → 20 → 30 → 45s, and interpolating within that would invent precision the instrument does not have.
+
+**One memory cell is missing rather than estimated.** kubelet @100 run 1 declared the board settled while 43 shims from the warm-up were still terminating, so its delta measured 43→104 rather than 0→100. Its memory figure is excluded; its latency is unaffected and is shown.
+
+**Finally, faster is not better.** kubelet carries device plugins, topology management, the full volume plugin ecosystem, and twelve years of hardening across configurations Periapsis has never been run through. The advantage measured here comes from dropping constraints kubelet cannot drop — CRI's runtime-pluggability, and the sandbox model that requires a shim and a pause container per pod — not from out-engineering it.
 
 ## Scale-To-Zero Wake Latency (2026-07-06)
 
@@ -128,7 +213,7 @@ physical host
 
 ## Benchmark Interpretation
 
-The important comparison is the removed per-container shim and CRI daemon path. Periapsis does not make workload memory disappear; application RSS still dominates for real services. The gain is in the node/runtime tax around many small or short-lived pods.
+The important comparison is the removed per-container shim and CRI daemon path — now measured directly rather than argued, in the head-to-head section above: the shims alone are ~46% of kubelet's memory delta at 200 pods. Periapsis does not make workload memory disappear; application RSS still dominates for real services. The gain is in the node/runtime tax around many small or short-lived pods.
 
 This makes the benchmark story strongest for:
 
