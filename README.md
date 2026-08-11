@@ -265,6 +265,8 @@ Two capabilities of the component model that a container runtime structurally ca
 - **Composition at launch.** A component's WIT imports can be satisfied by fusing a provider into a single component at launch, by plugging one in-process with live hot-swap (`apsis pods swap-plug`, no consumer restart), or by binding to a provider running on *another node* — with a scheduler moving a workload between those tiers from live traffic signals.
 - **Cross-architecture live migration.** A component that exports the checkpoint contract can be moved to another node — **including a node of a different CPU architecture** — with its in-memory state intact, via `apsis pods migrate <pod> --to <node>`: the source is checkpointed on a coordinated stop, the bytes are relayed, and the target restores and resumes. A `.wasm` component has no per-architecture build, so a cross-ISA move is the same mechanism as a same-host one. Live-validated **amd64 → arm64** (2026-07-09), with the target resolving the component image peer-to-peer and the counter continuing rather than resetting.
 
+Both of those capabilities need something above the node to decide *what binds to what*, and that is **Radiant** — the Trail operator, a leader-elected Deployment and the seam's cluster-side brain. It holds the registry that resolves a pod's declared seam need to a concrete provider (or derives it from the component's own WIT imports), promotes and demotes workloads between the composition tiers above from live signals, and owns the migration object behind `apsis pods migrate`. Binding is resolved at launch and then held by the node, so a Radiant outage stalls *new* policy decisions without breaking a single already-bound pod. Not to be confused with **meteor**, which shares only the sky — see [Naming](#naming).
+
 Checkpoint/restore here is *cooperative* by design — the component serializes its own state through a WIT seam — rather than an attempt to snapshot the engine's execution state, which a feasibility study found infeasible for components in the first place.
 
 **Networking** — [Constellation](https://github.com/malformed-c/constellation), a Cilium CNI fork, for the multi-pawn case: eBPF datapath, VXLAN cross-host routing, per-pod netns. Standard CNI (`/etc/cni/net.d`) covers standalone 1:1 host-to-node deployments. Cluster DNS, `dnsConfig`/`dnsPolicy`, managed `/etc/hosts` + `hostAliases`. Pod-to-pod (same/cross host), ClusterIP Services across hosts, NetworkPolicy, and Envoy Gateway L7 ingress all work with pawn-hosted workloads. Pods with a conflicting `hostPort` are rejected at admission the way a kubelet rejects them, rather than failing later at launch.
@@ -342,17 +344,47 @@ It now does the former as well: `perigeos` cold-starts its own apiserver, contro
 
 So the boundary here isn't hard. Run k3s in front of Periapsis nodes exactly as before, or don't run it at all.
 
+### vs Capsule
+
+Capsule is a **tenancy** layer: it groups namespaces into Tenants and constrains what each one may ask for — quotas, RBAC delegation, allowed ingress classes, network policy defaults — enforced by admission webhooks above the node. Tenants still share nodes, a kernel, and one container runtime.
+
+A pawn is not a tenancy concept at all. It is a node: its own cgroup slice, its own TLS identity, its own pod CIDR, its own scheduler entry. Where Capsule tells a tenant what it may request, a pawn is a boundary the kernel enforces whether anyone requested anything or not.
+
+That makes them complementary rather than competing, and the combination is the interesting one: give a tenant its own pawns via labels and taints, and its ceiling stops being a quota the control plane accounts for and becomes a cgroup the host enforces. Capsule keeps doing the part Periapsis has no opinion about — Periapsis has no tenancy model, no tenant owners, no self-service namespaces, and no plans for any.
+
+**One thing worth stating plainly, because "isolation" invites the wrong reading:** a pawn is not a security boundary against a hostile tenant, any more than a container is. It is namespaces and cgroups on a shared kernel. It buys resource containment and blast radius, not protection from a tenant attacking the kernel — for that, see [vs KubeVirt](#vs-kubevirt). Neither Capsule nor pawns change that; Capsule governs what tenants may do, pawns bound what they can consume.
+
 ### vs LXC / Incus
 
 Incus is a system container manager in its own right, with no Kubernetes above it: its own CLI, its own API, its own model of profiles and networks.
 
 Periapsis uses a similar isolation primitive — namespaces and cgroups via `systemd-nspawn`, the same class of thing as LXC — but remains a **Kubernetes node**: the same API server, the same scheduler, Deployments, Services, NetworkPolicy, and the whole existing toolchain and YAML ecosystem people already know. The difference isn't the isolation. It's what sits on top of it.
 
+### vs KubeVirt
+
+Both put something that is not an OCI container into a Kubernetes pod, and both use the word *machine*. They mean different things by it.
+
+KubeVirt runs a full virtual machine — its own kernel, its own bootloader, hardware-level isolation — inside a `virt-launcher` pod, which is itself an ordinary container. So a VM costs a guest kernel plus QEMU plus the entire CRI stack underneath it. Periapsis's machines are OS-level: namespaces and cgroups on the *host* kernel via `systemd-nspawn`. A pod really is a machine in the `machinectl` sense — it can run an init system, it appears in the machine registry — but it shares the kernel it runs on.
+
+**Where KubeVirt wins is not a tuning difference and no amount of nspawn work closes it:** a different kernel, a different operating system, or a tenant you do not trust with yours. Windows, an old kernel a vendor still requires, genuinely hostile multi-tenancy — that is KubeVirt or Kata, not this. The floor is the honest summary: a KubeVirt VM starts at a guest kernel and a QEMU process; a machine here starts at a supervisor process measured at 48 KB.
+
+They also compose. Nothing stops a cluster running KubeVirt nodes beside Periapsis nodes; they answer different questions about the same word.
+
 ### vs minikube / kind / k3d
 
 A single-node cluster on a laptop — or a pod-in-pod one, as with kind and k3d — is good for checking that a manifest applies. It is not good for checking the things Kubernetes exists for in the first place: how (anti-)affinity behaves, topology spread, Service and NetworkPolicy and CNI *between* nodes, or a PodDisruptionBudget under a real cordon and drain.
 
 One Periapsis host registers as 30+ independent pawns. That is an actual multi-node cluster to test against, not one node wearing several names — and since [pawns are shaped independently](#what-a-pawn-is), it can be a *heterogeneous* one.
+
+### vs Multus
+
+These get compared because both put more than one network identity on a single host, but they are orthogonal and neither substitutes for the other.
+
+Multus is a meta-CNI: it attaches **multiple interfaces to one pod**, so a workload can sit on a management network and a dataplane network at once, or reach an SR-IOV device directly. The pod stays on one node.
+
+Pawns go the other way. Each pawn is a separate **node** with its own pod CIDR, its own network namespace per pod, its own kubelet endpoint and TLS identity — and a pod on it still gets exactly one interface, as it would anywhere else. Pawns are a node-identity feature that happens to include networking, not a networking feature.
+
+So they answer different questions, and they should compose: Multus is invoked through the standard CNI path, which a Periapsis node with standard CNI configuration uses unchanged. **That combination has not been validated here**, and it is worth saying rather than implying — the multi-pawn case runs on [Constellation](https://github.com/malformed-c/constellation), and what a meta-CNI does across pawn boundaries has not been tested.
 
 ### vs Knative
 
@@ -391,6 +423,8 @@ Almost everything else falls out of that one subtraction, and most of it did not
 - "A node is a machine" stops being a law of nature — 30 pawns on one host are 30 cgroup slices with their own certificates.
 
 A kubelet does all of this too, at the cost of that layer: three daemons, a shim per container, its own log pipeline, and its own supervisor stacked on the supervisor every OS already ships. That's where the numbers in [Why](#why) come from — not "we optimised kubelet", but "we removed what it was obliged to carry".
+
+That claim is now measured rather than argued. On one board, the same Deployment, the same control plane on a separate machine, kubelet and Periapsis in turn: at 200 pods Periapsis deploys in ~40 s against 57 s, reaches Running ~2.2x sooner, uses 1.8x less host memory, and the node agent itself sits at ~150 MB against kubelet-plus-containerd's ~400 MB. The containerd-shims alone account for roughly 46% of kubelet's memory delta. Full tables, protocol, and the caveats that cut the other way are in [benches/README.md](benches/README.md).
 
 And to be entirely fair: **kubelet is not a mistake.** It was designed when "node" meant "physical machine", Docker was the only runtime, and systemd could not do half of what it does now. It made containers a boring, dependable technology, and it has earned a monument. A monument just doesn't have to stand on every node and eat half a gigabyte of memory.
 
